@@ -188,11 +188,8 @@ fn token_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 // --- эндпоинты ---
-
-#[derive(Deserialize)]
-struct IssueReq {
-    inviter: String,
-}
+// Команды атрибутируются текущему юзеру из сессии (`CurrentUser`), не из тела
+// запроса (ADR-0013): писать от чужого имени нельзя.
 
 #[derive(Serialize)]
 struct IssueRes {
@@ -203,15 +200,18 @@ struct IssueRes {
 
 async fn issue_invite(
     State(st): State<AppState>,
-    Json(req): Json<IssueReq>,
+    current: CurrentUser,
 ) -> Result<Json<IssueRes>, ApiError> {
-    let inviter = UserId::parse(&req.inviter).map_err(invalid)?;
     let uc = IssueInvite::new(
         PgIssueInviteTxFactory::new(st.db.clone()),
         SystemClock,
         RandomInviteCodeFactory,
     );
-    let event = uc.execute(IssueInviteCommand { inviter }).await?;
+    let event = uc
+        .execute(IssueInviteCommand {
+            inviter: current.id,
+        })
+        .await?;
     Ok(Json(IssueRes {
         invite_id: event.invite_id.to_string(),
         code: event.code.as_str().to_owned(),
@@ -340,7 +340,6 @@ async fn me(current: CurrentUser) -> Json<MeRes> {
 
 #[derive(Deserialize)]
 struct PostReq {
-    author: String,
     body: String,
 }
 
@@ -352,10 +351,11 @@ struct PostRes {
 
 async fn create_post(
     State(st): State<AppState>,
+    current: CurrentUser,
     Json(req): Json<PostReq>,
 ) -> Result<Json<PostRes>, ApiError> {
     let cmd = CreatePostCommand {
-        author: UserId::parse(&req.author).map_err(invalid)?,
+        author: current.id,
         body: PostBody::parse(&req.body).map_err(invalid)?,
     };
     let uc = CreatePost::new(PgPostRepository::new(st.db.clone()), SystemClock);
@@ -444,7 +444,6 @@ async fn feed(
 
 #[derive(Deserialize)]
 struct SendMessageReq {
-    author: String,
     recipient: String,
     body: String,
 }
@@ -458,10 +457,11 @@ struct SendMessageRes {
 
 async fn send_message(
     State(st): State<AppState>,
+    current: CurrentUser,
     Json(req): Json<SendMessageReq>,
 ) -> Result<Json<SendMessageRes>, ApiError> {
     let cmd = SendMessageCommand {
-        author: UserId::parse(&req.author).map_err(invalid)?,
+        author: current.id,
         recipient: UserId::parse(&req.recipient).map_err(invalid)?,
         body: MessageBody::parse(&req.body).map_err(invalid)?,
     };
@@ -480,7 +480,6 @@ async fn send_message(
 
 #[derive(Deserialize)]
 struct InboxParams {
-    user: String,
     limit: Option<u32>,
 }
 
@@ -494,13 +493,13 @@ struct ConversationRes {
 
 async fn inbox(
     State(st): State<AppState>,
+    current: CurrentUser,
     Query(params): Query<InboxParams>,
 ) -> Result<Json<Vec<ConversationRes>>, ApiError> {
-    let user = UserId::parse(&params.user).map_err(invalid)?;
     let uc = InboxQuery::new(PgInboxReadModel::new(st.db.clone()));
     let items = uc
         .execute(InboxOf {
-            user,
+            user: current.id,
             limit: params.limit.unwrap_or(50),
         })
         .await?;
@@ -518,7 +517,6 @@ async fn inbox(
 
 #[derive(Deserialize)]
 struct ThreadParams {
-    viewer: String,
     limit: Option<u32>,
 }
 
@@ -532,16 +530,16 @@ struct MessageRes {
 
 async fn thread(
     State(st): State<AppState>,
+    current: CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<ThreadParams>,
 ) -> Result<Json<Vec<MessageRes>>, ApiError> {
     let conversation = ConversationId::parse(&id).map_err(invalid)?;
-    let viewer = UserId::parse(&params.viewer).map_err(invalid)?;
     let uc = ThreadQuery::new(PgThreadReadModel::new(st.db.clone()));
     let items = uc
         .execute(ThreadOf {
             conversation,
-            viewer,
+            viewer: current.id,
             limit: params.limit.unwrap_or(100),
         })
         .await?;
@@ -561,7 +559,6 @@ async fn thread(
 
 #[derive(Deserialize)]
 struct FoundGroupReq {
-    founder: String,
     slug: String,
     name: String,
     kind: String,
@@ -575,10 +572,11 @@ struct FoundGroupRes {
 
 async fn found_group(
     State(st): State<AppState>,
+    current: CurrentUser,
     Json(req): Json<FoundGroupReq>,
 ) -> Result<Json<FoundGroupRes>, ApiError> {
     let cmd = FoundGroupCommand {
-        founder: UserId::parse(&req.founder).map_err(invalid)?,
+        founder: current.id,
         slug: GroupSlug::parse(&req.slug).map_err(invalid)?,
         name: GroupName::parse(&req.name).map_err(invalid)?,
         kind: GroupKind::parse(&req.kind).map_err(invalid)?,
@@ -621,11 +619,6 @@ async fn group_view(
     Ok(Json(view.into()))
 }
 
-#[derive(Deserialize)]
-struct MemberReq {
-    user: String,
-}
-
 #[derive(Serialize)]
 struct MembershipRes {
     group_id: String,
@@ -635,13 +628,17 @@ struct MembershipRes {
 
 async fn join_group(
     State(st): State<AppState>,
+    current: CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<MemberReq>,
 ) -> Result<Json<MembershipRes>, ApiError> {
     let group = GroupId::parse(&id).map_err(invalid)?;
-    let user = UserId::parse(&req.user).map_err(invalid)?;
     let uc = JoinGroup::new(PgGroupMembershipTxFactory::new(st.db.clone()), SystemClock);
-    let event = uc.execute(JoinGroupCommand { group, user }).await?;
+    let event = uc
+        .execute(JoinGroupCommand {
+            group,
+            user: current.id,
+        })
+        .await?;
     Ok(Json(MembershipRes {
         group_id: event.group.to_string(),
         user: event.user.to_string(),
@@ -651,13 +648,17 @@ async fn join_group(
 
 async fn leave_group(
     State(st): State<AppState>,
+    current: CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<MemberReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let group = GroupId::parse(&id).map_err(invalid)?;
-    let user = UserId::parse(&req.user).map_err(invalid)?;
     let uc = LeaveGroup::new(PgGroupMembershipTxFactory::new(st.db.clone()), SystemClock);
-    let event = uc.execute(LeaveGroupCommand { group, user }).await?;
+    let event = uc
+        .execute(LeaveGroupCommand {
+            group,
+            user: current.id,
+        })
+        .await?;
     Ok(Json(json!({
         "group_id": event.group.to_string(),
         "user": event.user.to_string(),
@@ -667,19 +668,19 @@ async fn leave_group(
 
 #[derive(Deserialize)]
 struct SetRoleReq {
-    actor: String,
     target: String,
     role: String,
 }
 
 async fn set_role(
     State(st): State<AppState>,
+    current: CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<SetRoleReq>,
 ) -> Result<Json<MembershipRes>, ApiError> {
     let cmd = SetMemberRoleCommand {
         group: GroupId::parse(&id).map_err(invalid)?,
-        actor: UserId::parse(&req.actor).map_err(invalid)?,
+        actor: current.id,
         target: UserId::parse(&req.target).map_err(invalid)?,
         role: MembershipRole::parse(&req.role).map_err(invalid)?,
     };
@@ -694,17 +695,17 @@ async fn set_role(
 
 #[derive(Deserialize)]
 struct GroupPostReq {
-    author: String,
     body: String,
 }
 
 async fn post_to_group(
     State(st): State<AppState>,
+    current: CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<GroupPostReq>,
 ) -> Result<Json<PostRes>, ApiError> {
     let cmd = PostToGroupCommand {
-        author: UserId::parse(&req.author).map_err(invalid)?,
+        author: current.id,
         group: GroupId::parse(&id).map_err(invalid)?,
         body: PostBody::parse(&req.body).map_err(invalid)?,
     };

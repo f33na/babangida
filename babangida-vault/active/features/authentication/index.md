@@ -59,3 +59,10 @@ rate-limit логина, скользящий срок сессии, хэш то
   postgres зелёный (register+пароль → login → /me → logout → 401). Найден пробол: root
   без кредов (см. ADR-0013 Consequences). ADR-0013 всё ещё Proposed.
 - 2026-06-26: ADR-0013 акцептован (Accepted) пользователем.
+- 2026-06-26: шаг 2b — `CurrentUser` раскатан на все write-хендлеры (issue_invite,
+  create_post, send_message, inbox, thread, found_group, join, leave, set_role,
+  post_to_group): автор/актор/участник берётся из сессии, не из тела. Параметры
+  author/viewer/founder/actor/inviter/user убраны. Публичные чтения (feed, profile,
+  group_view) — без auth. http_it и messaging_community_it переписаны на auth-поток
+  (seed-админ получает креды через EstablishCredential и логинится; каждый юзер
+  логинится). Дыра «писать от чужого имени» закрыта. Тесты против postgres зелёные.

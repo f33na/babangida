@@ -9,22 +9,27 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use babangida_api::{AppState, router};
+use babangida_application::command::{EstablishCredential, EstablishCredentialCommand};
+use babangida_domain::auth::Password;
 use babangida_domain::identity::{Handle, User, UserRepository, UserRole};
-use babangida_infrastructure::{Db, PgUserRepository, connect, run_migrations};
+use babangida_infrastructure::{
+    Argon2PasswordHasher, PgCredentialRepository, PgUserRepository, SystemClock, connect,
+    run_migrations,
+};
 use babangida_shared::{Id, Timestamp};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-async fn setup() -> Option<(Db, String)> {
+/// Поднять схему, засеять админа с паролем и залогинить его. Возвращает роутер и
+/// токен админа (выдача инвайта теперь под аутентификацией).
+async fn setup() -> Option<(Router, String)> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let db = connect(&url).await.ok()?;
     run_migrations(&db).await.expect("миграции");
-    sqlx::query(
-        "TRUNCATE users, invites, profiles, credentials, sessions RESTART IDENTITY CASCADE",
-    )
-    .execute(&db)
-    .await
-    .expect("truncate");
+    sqlx::query("TRUNCATE users, groups RESTART IDENTITY CASCADE")
+        .execute(&db)
+        .await
+        .expect("truncate");
     let admin = User::register(
         Id::generate(),
         Handle::parse("rootadmin").unwrap(),
@@ -35,7 +40,20 @@ async fn setup() -> Option<(Db, String)> {
         .save(&admin)
         .await
         .expect("seed admin");
-    Some((db, admin.id().to_string()))
+    EstablishCredential::new(
+        PgCredentialRepository::new(db.clone()),
+        Argon2PasswordHasher,
+        SystemClock,
+    )
+    .execute(EstablishCredentialCommand {
+        user: admin.id(),
+        password: Password::parse("rootpassword").unwrap(),
+    })
+    .await
+    .expect("seed admin cred");
+    let app = router(AppState { db });
+    let token = login(&app, "rootadmin", "rootpassword").await;
+    Some((app, token))
 }
 
 /// Запрос с опциональным телом и Bearer-токеном.
@@ -68,23 +86,32 @@ async fn request(
     (status, value)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auth_end_to_end() {
-    let Some((db, admin_id)) = setup().await else {
-        eprintln!("SKIP auth_end_to_end: DATABASE_URL не задан");
-        return;
-    };
-    let app = router(AppState { db });
-
-    // admin выдаёт инвайт (выдача в 2a ещё по параметру)
+async fn login(app: &Router, handle: &str, password: &str) -> String {
     let (status, body) = request(
-        &app,
+        app,
         "POST",
-        "/invites",
-        Some(json!({ "inviter": admin_id })),
+        "/login",
+        Some(json!({ "handle": handle, "password": password })),
         None,
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "логин {handle}: {body}");
+    body["token"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_end_to_end() {
+    let Some((app, admin_token)) = setup().await else {
+        eprintln!("SKIP auth_end_to_end: DATABASE_URL не задан");
+        return;
+    };
+
+    // запись без токена запрещена: выдача инвайта → 401
+    let (status, _) = request(&app, "POST", "/invites", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "без сессии писать нельзя");
+
+    // admin (по токену) выдаёт инвайт
+    let (status, body) = request(&app, "POST", "/invites", None, Some(&admin_token)).await;
     assert_eq!(status, StatusCode::OK, "выдача инвайта: {body}");
     let code = body["code"].as_str().unwrap().to_owned();
 
@@ -106,17 +133,7 @@ async fn auth_end_to_end() {
     assert_eq!(status, StatusCode::OK, "регистрация: {body}");
 
     // логин по верному паролю → токен сессии
-    let (status, body) = request(
-        &app,
-        "POST",
-        "/login",
-        Some(json!({ "handle": "newcomer", "password": "newcomerpass" })),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "логин: {body}");
-    let token = body["token"].as_str().unwrap().to_owned();
-    assert!(body["expires_at"].as_i64().unwrap() > 0);
+    let token = login(&app, "newcomer", "newcomerpass").await;
 
     // GET /me по токену → распознан текущий юзер
     let (status, body) = request(&app, "GET", "/me", None, Some(&token)).await;
