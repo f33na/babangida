@@ -30,7 +30,7 @@ HTTP-срез (миграция, infra, api, экстрактор-гейт, ин
 
 ## Technical
 
-Модель — [[decisions/0014-marketplace-model]] (**Proposed**). Гейт — из
+Модель — [[decisions/0014-marketplace-model]] (Accepted). Гейт — из
 [[decisions/0010-verification-model]]; «домен решает, application читает» — по образцу
 [[decisions/0011-invite-issuance-atomicity]] и [[decisions/0003-domain-as-source-of-truth]];
 чтение — read-модели [[decisions/0004-cqrs-read-write-split]].
@@ -49,3 +49,11 @@ HTTP-срез (миграция, infra, api, экстрактор-гейт, ин
 
 - 2026-06-26: создано; шаг 1 — доменное ядро `marketplace` + use-cases (без БД).
   5 доменных и 4 прикладных юнит-теста зелёные. ADR-0014 — Proposed, ждёт акцепта.
+- 2026-06-26: ADR-0014 акцептован (Accepted) пользователем.
+- 2026-06-26: шаг 2 — HTTP-срез. Миграция `0006` (listings). infra: `PgListingRepository`
+  (реконституция через домен), `PgListingReadModel` (active/by_seller). api: `POST /listings`,
+  `/listings/{id}/sold|withdraw` (под `CurrentUser`), `GET /market`, `GET /profiles/{handle}/listings`
+  (публичные), `POST /users/{handle}/verify` (админ). Тест `marketplace_it` против postgres
+  зелёный: casual→403, верификация→продажа→виден в маркете/профиле, не-продавец sold→403,
+  sold уходит из маркета, не-админ verify→403, без сессии→401. Верификация действует сразу
+  на той же сессии (статус перечитывается). Bootstrap-root по-прежнему открыт (ADR-0013).

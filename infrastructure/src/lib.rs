@@ -9,6 +9,7 @@ mod content;
 mod error;
 mod identity;
 mod invite_code;
+mod marketplace;
 mod messaging;
 mod pool;
 
@@ -22,6 +23,7 @@ pub use community::{
 pub use content::{PgFeedReadModel, PgPostRepository, PgProfileReadModel};
 pub use identity::{PgIssueInviteTxFactory, PgRegistrationTxFactory, PgUserRepository};
 pub use invite_code::RandomInviteCodeFactory;
+pub use marketplace::{PgListingReadModel, PgListingRepository};
 pub use messaging::{
     PgConversationRepository, PgInboxReadModel, PgMessageRepository, PgThreadReadModel,
 };

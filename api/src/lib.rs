@@ -13,15 +13,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use babangida_application::ApplicationError;
 use babangida_application::command::{
-    Authenticate, AuthenticateCommand, CreatePost, CreatePostCommand, FoundGroup,
-    FoundGroupCommand, IssueInvite, IssueInviteCommand, JoinGroup, JoinGroupCommand, LeaveGroup,
-    LeaveGroupCommand, LogIn, LogInCommand, LogOut, LogOutCommand, PostToGroup, PostToGroupCommand,
-    Register, RegisterCommand, SendMessage, SendMessageCommand, SetMemberRole,
-    SetMemberRoleCommand,
+    Authenticate, AuthenticateCommand, CreateListing, CreateListingCommand, CreatePost,
+    CreatePostCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand, JoinGroup,
+    JoinGroupCommand, LeaveGroup, LeaveGroupCommand, LogIn, LogInCommand, LogOut, LogOutCommand,
+    MarkListingSold, MarkListingSoldCommand, PostToGroup, PostToGroupCommand, Register,
+    RegisterCommand, SendMessage, SendMessageCommand, SetMemberRole, SetMemberRoleCommand,
+    VerifyUser, VerifyUserCommand, WithdrawListing, WithdrawListingCommand,
 };
 use babangida_application::query::{
-    FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf, InboxQuery, ProfileByHandle,
-    ProfileQuery, ProfileView, RecentFeed, ThreadOf, ThreadQuery,
+    FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf, InboxQuery, ListingView, MarketBrowse,
+    MarketQuery, ProfileByHandle, ProfileQuery, ProfileView, RecentFeed, SellerListings,
+    SellerListingsQuery, ThreadOf, ThreadQuery,
 };
 use babangida_domain::RepositoryError;
 use babangida_domain::auth::{AuthError, Password, SESSION_TTL, SessionToken};
@@ -30,15 +32,18 @@ use babangida_domain::community::{
 };
 use babangida_domain::content::PostBody;
 use babangida_domain::identity::{Handle, InviteCode, UserId, VerifiedStatus};
-use babangida_domain::marketplace::MarketplaceError;
+use babangida_domain::marketplace::{
+    ListingDescription, ListingDraft, ListingId, ListingTitle, MarketplaceError, Price,
+};
 use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_infrastructure::{
     Argon2PasswordHasher, Db, PgConversationRepository, PgCredentialRepository, PgFeedReadModel,
     PgGroupMembershipTxFactory, PgGroupPostRepository, PgGroupReadModel, PgGroupRepository,
-    PgInboxReadModel, PgIssueInviteTxFactory, PgMessageRepository, PgPostRepository,
-    PgProfileReadModel, PgRegistrationTxFactory, PgSessionRepository, PgThreadReadModel,
-    PgUserRepository, RandomInviteCodeFactory, RandomSessionTokenFactory, SystemClock,
+    PgInboxReadModel, PgIssueInviteTxFactory, PgListingReadModel, PgListingRepository,
+    PgMessageRepository, PgPostRepository, PgProfileReadModel, PgRegistrationTxFactory,
+    PgSessionRepository, PgThreadReadModel, PgUserRepository, RandomInviteCodeFactory,
+    RandomSessionTokenFactory, SystemClock,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -72,6 +77,14 @@ pub fn router(state: AppState) -> Router {
         .route("/groups/{id}/leave", post(leave_group))
         .route("/groups/{id}/role", post(set_role))
         .route("/groups/{id}/posts", post(post_to_group))
+        // marketplace (продажа — за гейтом верификации; чтение — публичное)
+        .route("/listings", post(create_listing))
+        .route("/listings/{id}/sold", post(mark_listing_sold))
+        .route("/listings/{id}/withdraw", post(withdraw_listing))
+        .route("/market", get(market))
+        .route("/profiles/{handle}/listings", get(seller_listings))
+        // верификация (админ открывает привилегированные зоны, ADR-0010)
+        .route("/users/{handle}/verify", post(verify_user))
         .with_state(state)
 }
 
@@ -728,4 +741,157 @@ async fn post_to_group(
         post_id: post.id().to_string(),
         created_at: post.created_at().into_offset().unix_timestamp(),
     }))
+}
+
+// --- marketplace ---
+
+#[derive(Deserialize)]
+struct ListingReq {
+    title: String,
+    price: u64,
+    description: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreatedListingRes {
+    listing_id: String,
+    status: String,
+    created_at: i64,
+}
+
+async fn create_listing(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Json(req): Json<ListingReq>,
+) -> Result<Json<CreatedListingRes>, ApiError> {
+    let description = req
+        .description
+        .as_deref()
+        .map(ListingDescription::parse)
+        .transpose()
+        .map_err(invalid)?;
+    let draft = ListingDraft {
+        title: ListingTitle::parse(&req.title).map_err(invalid)?,
+        price: Price::parse(req.price).map_err(invalid)?,
+        description,
+    };
+    let uc = CreateListing::new(
+        PgUserRepository::new(st.db.clone()),
+        PgListingRepository::new(st.db.clone()),
+        SystemClock,
+    );
+    let listing = uc
+        .execute(CreateListingCommand {
+            seller: current.id,
+            draft,
+        })
+        .await?;
+    Ok(Json(CreatedListingRes {
+        listing_id: listing.id().to_string(),
+        status: listing.status().as_str().to_owned(),
+        created_at: listing.created_at().into_offset().unix_timestamp(),
+    }))
+}
+
+async fn mark_listing_sold(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let listing = ListingId::parse(&id).map_err(invalid)?;
+    MarkListingSold::new(PgListingRepository::new(st.db.clone()))
+        .execute(MarkListingSoldCommand {
+            listing,
+            actor: current.id,
+        })
+        .await?;
+    Ok(Json(json!({ "listing_id": id, "status": "sold" })))
+}
+
+async fn withdraw_listing(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let listing = ListingId::parse(&id).map_err(invalid)?;
+    WithdrawListing::new(PgListingRepository::new(st.db.clone()))
+        .execute(WithdrawListingCommand {
+            listing,
+            actor: current.id,
+        })
+        .await?;
+    Ok(Json(json!({ "listing_id": id, "status": "withdrawn" })))
+}
+
+#[derive(Serialize)]
+struct ListingRes {
+    listing_id: String,
+    seller: String,
+    seller_handle: String,
+    title: String,
+    price: u64,
+    description: Option<String>,
+    status: String,
+    created_at: i64,
+}
+
+impl From<ListingView> for ListingRes {
+    fn from(v: ListingView) -> Self {
+        Self {
+            listing_id: v.listing_id.to_string(),
+            seller: v.seller.to_string(),
+            seller_handle: v.seller_handle,
+            title: v.title,
+            price: v.price_rubles,
+            description: v.description,
+            status: v.status,
+            created_at: v.created_at.into_offset().unix_timestamp(),
+        }
+    }
+}
+
+async fn market(
+    State(st): State<AppState>,
+    Query(params): Query<FeedParams>,
+) -> Result<Json<Vec<ListingRes>>, ApiError> {
+    let uc = MarketQuery::new(PgListingReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(MarketBrowse {
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    Ok(Json(items.into_iter().map(ListingRes::from).collect()))
+}
+
+async fn seller_listings(
+    State(st): State<AppState>,
+    Path(handle): Path<String>,
+    Query(params): Query<FeedParams>,
+) -> Result<Json<Vec<ListingRes>>, ApiError> {
+    let uc = SellerListingsQuery::new(PgListingReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(SellerListings {
+            handle,
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    Ok(Json(items.into_iter().map(ListingRes::from).collect()))
+}
+
+async fn verify_user(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Path(handle): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let target = Handle::parse(&handle).map_err(invalid)?;
+    let user = VerifyUser::new(PgUserRepository::new(st.db.clone()))
+        .execute(VerifyUserCommand {
+            actor: current.id,
+            target,
+        })
+        .await?;
+    Ok(Json(json!({
+        "handle": user.handle().as_str(),
+        "verified": user.verified().is_verified(),
+    })))
 }
