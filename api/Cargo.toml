@@ -1,0 +1,17 @@
+[package]
+name = "babangida-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Точка композиции (axum появится с первым хендлером). Доменные правила вызывает,
+# не дублирует — см. ADR-0003/0004.
+babangida-application.workspace = true
+babangida-domain.workspace = true
+babangida-shared.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "babangida-infrastructure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Адаптеры (postgres/sqlx и т.п.) реализуют доменные порты. sqlx добавляется,
+# когда появляется первая реализация репозитория — пока крейт пустой.
+babangida-application.workspace = true
+babangida-domain.workspace = true
+babangida-shared.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "babangida-shared"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+uuid.workspace = true
+time.workspace = true
+serde.workspace = true
+thiserror.workspace = true

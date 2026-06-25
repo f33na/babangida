@@ -1,0 +1,17 @@
+[package]
+name = "babangida-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# domain зависит ТОЛЬКО от shared-kernel + чистых утилит (thiserror, async-trait).
+# Никаких axum/sqlx/leptos/dioxus — ADR-0003.
+babangida-shared.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true

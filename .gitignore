@@ -1,0 +1,20 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Nix
+result
+result-*
+.direnv/
+
+# Локальный postgres из flake (pg-start)
+/.pg/
+
+# Окружение
+.env
+.env.*
+!.env.example
+
+# Прочее
+.DS_Store
+*.swp

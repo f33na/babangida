@@ -1,0 +1,7 @@
+# Пиннинг тулчейна. Один источник и для rustup, и для Nix-флейка
+# (oxalica fromRustupToolchainFile читает этот файл). См. ADR-0001/0009.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt", "rust-src"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

@@ -1,0 +1,17 @@
+[package]
+name = "babangida-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Презентация (Leptos SSR, ADR-0006). Use-cases — через `application`, UI — через
+# `uikit`. leptos добавится с первым экраном.
+babangida-application.workspace = true
+babangida-uikit.workspace = true
+babangida-shared.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "babangida-mobile-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Dioxus + нативный шелл (ADR-0007, самая рискованная ставка). Шарит `domain` и
+# `uikit`. dioxus и нативный тулчейн добавятся с первым виджетом.
+babangida-domain.workspace = true
+babangida-uikit.workspace = true
+babangida-shared.workspace = true

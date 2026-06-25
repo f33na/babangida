@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+    "shared",
+    "domain",
+    "application",
+    "infrastructure",
+    "api",
+    "uikit",
+    "web",
+    "mobile-ios",
+    "mobile-android",
+]
+
+# Общие поля для всех крейтов. Версии и стек зафиксированы в
+# `babangida-vault/stable/stack.md` и ADR-0001.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "UNLICENSED"
+publish = false
+
+# Единый источник версий внешних зависимостей. Крейты подключают их через
+# `dep.workspace = true` по мере появления реальной потребности — пока крейты
+# пустые (фундамент без бизнес-логики), большинство не используется. Декларация
+# здесь ничего не тянет в lock, пока крейт явно не сослался на зависимость.
+[workspace.dependencies]
+# backend
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower = "0.5"
+tower-http = "0.6"
+async-trait = "0.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "time"] }
+# web / mobile
+leptos = "0.7"
+dioxus = "0.6"
+# cross-cutting
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["macros"] }
+tracing = "0.1"
+# внутренние крейты (path-зависимости задают направление зависимостей слоёв)
+babangida-shared = { path = "shared" }
+babangida-domain = { path = "domain" }
+babangida-application = { path = "application" }
+babangida-infrastructure = { path = "infrastructure" }
+babangida-api = { path = "api" }
+babangida-uikit = { path = "uikit" }
+
+# Линты на весь workspace. clippy в CI запускается с `-D warnings`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

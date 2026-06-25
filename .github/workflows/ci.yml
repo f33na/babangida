@@ -1,0 +1,22 @@
+name: CI
+
+# Шаблон CI (ADR-0009): fmt + clippy + check + test через тот же Nix-флейк,
+# что и локальная разработка. Один источник окружения для dev и CI.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: fmt + clippy + check + test
+        run: nix run .#ci
