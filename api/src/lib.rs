@@ -14,11 +14,12 @@ use axum::routing::{get, post};
 use babangida_application::ApplicationError;
 use babangida_application::command::{
     Authenticate, AuthenticateCommand, CreateListing, CreateListingCommand, CreatePost,
-    CreatePostCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand, JoinGroup,
-    JoinGroupCommand, LeaveGroup, LeaveGroupCommand, LogIn, LogInCommand, LogOut, LogOutCommand,
-    MarkListingSold, MarkListingSoldCommand, PostToGroup, PostToGroupCommand, Register,
-    RegisterCommand, SendMessage, SendMessageCommand, SetMemberRole, SetMemberRoleCommand,
-    VerifyUser, VerifyUserCommand, WithdrawListing, WithdrawListingCommand,
+    CreatePostCommand, EstablishCredential, EstablishCredentialCommand, FoundGroup,
+    FoundGroupCommand, IssueInvite, IssueInviteCommand, JoinGroup, JoinGroupCommand, LeaveGroup,
+    LeaveGroupCommand, LogIn, LogInCommand, LogOut, LogOutCommand, MarkListingSold,
+    MarkListingSoldCommand, PostToGroup, PostToGroupCommand, Register, RegisterCommand,
+    SendMessage, SendMessageCommand, SetMemberRole, SetMemberRoleCommand, VerifyUser,
+    VerifyUserCommand, WithdrawListing, WithdrawListingCommand,
 };
 use babangida_application::query::{
     FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf, InboxQuery, ListingView, MarketBrowse,
@@ -31,7 +32,7 @@ use babangida_domain::community::{
     CommunityError, GroupId, GroupKind, GroupName, GroupSlug, MembershipRole,
 };
 use babangida_domain::content::PostBody;
-use babangida_domain::identity::{Handle, InviteCode, UserId, VerifiedStatus};
+use babangida_domain::identity::{Handle, InviteCode, UserId, UserRepository, VerifiedStatus};
 use babangida_domain::marketplace::{
     ListingDescription, ListingDraft, ListingId, ListingTitle, MarketplaceError, Price,
 };
@@ -86,6 +87,40 @@ pub fn router(state: AppState) -> Router {
         // верификация (админ открывает привилегированные зоны, ADR-0010)
         .route("/users/{handle}/verify", post(verify_user))
         .with_state(state)
+}
+
+/// Bootstrap-пароля сид-админа (ADR-0013): сид-миграция заводит `root` без кредов,
+/// и войти он не может. Эта функция на старте, если задан пароль, ставит/обновляет
+/// его учётные данные. Идемпотентна. Вызывается из бинаря по env `ADMIN_BOOTSTRAP_*`.
+///
+/// Возвращает `Ok(true)`, если креды установлены; `Ok(false)`, если админа с таким
+/// handle нет (пропуск).
+///
+/// # Errors
+/// Строка с причиной: невалидный handle/пароль или сбой хранилища.
+pub async fn bootstrap_admin(db: &Db, handle: &str, raw_password: &str) -> Result<bool, String> {
+    let handle = Handle::parse(handle).map_err(|e| format!("ADMIN_BOOTSTRAP_HANDLE: {e}"))?;
+    let password =
+        Password::parse(raw_password).map_err(|e| format!("ADMIN_BOOTSTRAP_PASSWORD: {e}"))?;
+    let Some(admin) = PgUserRepository::new(db.clone())
+        .find_by_handle(&handle)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+    EstablishCredential::new(
+        PgCredentialRepository::new(db.clone()),
+        Argon2PasswordHasher,
+        SystemClock,
+    )
+    .execute(EstablishCredentialCommand {
+        user: admin.id(),
+        password,
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 // --- ошибки → HTTP ---

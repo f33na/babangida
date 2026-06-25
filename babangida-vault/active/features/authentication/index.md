@@ -66,3 +66,8 @@ rate-limit логина, скользящий срок сессии, хэш то
   group_view) — без auth. http_it и messaging_community_it переписаны на auth-поток
   (seed-админ получает креды через EstablishCredential и логинится; каждый юзер
   логинится). Дыра «писать от чужого имени» закрыта. Тесты против postgres зелёные.
+- 2026-06-26: закрыт пробел bootstrap-root (ADR-0013 Consequences). `babangida_api::bootstrap_admin`
+  на старте бинаря по env `ADMIN_BOOTSTRAP_PASSWORD` (+ опц. `ADMIN_BOOTSTRAP_HANDLE`,
+  дефолт `root`) ставит/обновляет креды сид-админа через use-case `EstablishCredential`.
+  Идемпотентно; без env — no-op; нет такого админа — пропуск. Тест `bootstrap_it` против
+  postgres: до bootstrap вход 401, после — 200. Теперь у `root` появляется реальный вход.
