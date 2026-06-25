@@ -17,8 +17,10 @@ use babangida_application::query::{
     FeedQuery, ProfileByHandle, ProfileQuery, ProfileView, RecentFeed,
 };
 use babangida_domain::RepositoryError;
+use babangida_domain::community::CommunityError;
 use babangida_domain::content::PostBody;
 use babangida_domain::identity::{Handle, InviteCode, UserId};
+use babangida_domain::messaging::MessagingError;
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_infrastructure::{
     Db, PgFeedReadModel, PgIssueInviteTxFactory, PgPostRepository, PgProfileReadModel,
@@ -73,6 +75,21 @@ fn app_error_response(err: ApplicationError) -> (StatusCode, String) {
     match err {
         // Нарушение доменного правила инвайта — конфликт с текущим состоянием.
         ApplicationError::Invite(e) => (StatusCode::CONFLICT, e.to_string()),
+        // Переписка: само-диалог — некорректный ввод; чужой диалог — запрещено.
+        ApplicationError::Messaging(e @ MessagingError::SelfConversation) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
+        ApplicationError::Messaging(e @ MessagingError::NotParticipant) => {
+            (StatusCode::FORBIDDEN, e.to_string())
+        }
+        // Сообщества: нет прав — запрещено; цели нет — 404; остальное — конфликт состояния.
+        ApplicationError::Community(e @ CommunityError::NotPermitted) => {
+            (StatusCode::FORBIDDEN, e.to_string())
+        }
+        ApplicationError::Community(
+            e @ (CommunityError::TargetNotMember | CommunityError::NotMember),
+        ) => (StatusCode::NOT_FOUND, e.to_string()),
+        ApplicationError::Community(e) => (StatusCode::CONFLICT, e.to_string()),
         ApplicationError::NotFound(what) => (StatusCode::NOT_FOUND, format!("не найдено: {what}")),
         ApplicationError::Repository(RepositoryError::NotFound) => {
             (StatusCode::NOT_FOUND, "не найдено".to_owned())
