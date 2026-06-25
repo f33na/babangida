@@ -35,6 +35,12 @@ async-trait = "0.1"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "time"] }
 # web / mobile
 leptos = "0.7"
+leptos_meta = "0.7"
+leptos_router = "0.7"
+leptos_axum = "0.7"
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dioxus = "0.6"
 # cross-cutting
 serde = { version = "1", features = ["derive"] }

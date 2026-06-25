@@ -2,10 +2,9 @@
 
 ## Status
 
-Proposed — 2026-06-25
+Accepted — 2026-06-25
 
-На ревью (framework §7: ADR без ревью человеком не финализируем). Возник при реализации
-Prompt 2 как закрытие TOCTOU, помеченного в коде `IssueInvite::execute`.
+Принят при ревью Prompt 2. Закрывает TOCTOU, помеченный в коде `IssueInvite::execute`.
 
 ## Context
 

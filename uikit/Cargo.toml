@@ -8,3 +8,11 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Leptos-компоненты опциональны: токены (модуль `tokens`) framework-agnostic и
+# доступны всегда (в т.ч. для mobile/Dioxus, ADR-0008); компоненты — под `leptos`.
+leptos = ["dep:leptos"]
+
+[dependencies]
+leptos = { workspace = true, optional = true }

@@ -6,12 +6,51 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [lints]
 workspace = true
 
 [dependencies]
-# Презентация (Leptos SSR, ADR-0006). Use-cases — через `application`, UI — через
-# `uikit`. leptos добавится с первым экраном.
-babangida-application.workspace = true
-babangida-uikit.workspace = true
-babangida-shared.workspace = true
+# Презентация (Leptos SSR, ADR-0006); UI — через `uikit` (ADR-0008). Данные —
+# через HTTP API (reqwest в server-функциях), без зависимости на infrastructure.
+babangida-uikit = { workspace = true, features = ["leptos"] }
+leptos.workspace = true
+leptos_meta.workspace = true
+leptos_router.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# ssr-only. axum 0.7 (а не workspace 0.8) — этого требует leptos_axum 0.7;
+# api-крейт остаётся на axum 0.8. Сосуществуют в lock без конфликта.
+axum = { version = "0.7", optional = true }
+tokio = { workspace = true, features = ["net"], optional = true }
+leptos_axum = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+
+# hydrate-only
+wasm-bindgen = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+
+[features]
+default = ["ssr"]
+hydrate = ["leptos/hydrate", "dep:wasm-bindgen", "dep:console_error_panic_hook"]
+ssr = [
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+    "dep:axum",
+    "dep:tokio",
+    "dep:leptos_axum",
+    "dep:reqwest",
+]
+
+[package.metadata.leptos]
+output-name = "babangida_web"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+tailwind-input-file = "style/input.css"
+assets-dir = "public"
+bin-features = ["ssr"]
+lib-features = ["hydrate"]

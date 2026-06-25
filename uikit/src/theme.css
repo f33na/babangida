@@ -1,0 +1,41 @@
+/* Дизайн-токены babangida как CSS-переменные. Тёмная тема — дефолт на :root;
+   светлая — через [data-theme="light"]. Канон значений — stable/design-system.md.
+   Подключается в web; Tailwind-утилиты ссылаются на эти var(), не на хардкод. */
+
+:root,
+:root[data-theme="dark"] {
+  --bg: #0E0E0E;
+  --bg-alt: #121212;
+  --surface: #1A1A1A;
+  --surface-raised: #222222;
+  --border: #2A2A2A;
+  --text: #F5F1E8;
+  --text-muted: #A8A29A;
+  --accent: #6B4423;
+  --accent-hover: #8A5A2E;
+  --accent-contrast: #F5F1E8;
+  --danger: #8B2E2E;
+  --radius: 2px;
+  --radius-lg: 4px;
+}
+
+:root[data-theme="light"] {
+  --bg: #F5F1E8;
+  --bg-alt: #ECE6D8;
+  --surface: #FBF8F1;
+  --surface-raised: #FFFFFF;
+  --border: #DDD5C5;
+  --text: #1A1614;
+  --text-muted: #6B645C;
+  --accent: #6B4423;
+  --accent-hover: #5A381C;
+  --accent-contrast: #F5F1E8;
+  --danger: #9B2C2C;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+}

@@ -79,6 +79,10 @@
             pgStop
             pkgs.pkg-config
             pkgs.openssl
+            # frontend (Leptos SSR, ADR-0006): сборка web через `cargo leptos`.
+            pkgs.cargo-leptos
+            pkgs.tailwindcss
+            pkgs.binaryen
           ];
 
           shellHook = ''

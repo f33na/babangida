@@ -1,0 +1,6 @@
+/* Вход Tailwind для cargo-leptos. Токены-переменные — из uikit/theme.css. */
+@import "../../uikit/src/theme.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
