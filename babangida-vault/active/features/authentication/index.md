@@ -51,3 +51,10 @@ rate-limit логина, скользящий срок сессии, хэш то
 
 - 2026-06-26: создано; шаг 1 — доменное ядро `auth` + use-cases (без БД). 7 доменных и
   7 прикладных юнит-тестов зелёные. ADR-0013 — Proposed, ждёт акцепта на ревью.
+- 2026-06-26: шаг 2a — HTTP-срез (часть 1). Миграция `0005` (credentials, sessions);
+  infra: argon2id-хэшер, CSPRNG-фабрика токенов, Pg-репозитории кредов/сессий; пароль
+  в регистрации (атомарно в tx регистрации); эндпоинты `POST /login` (set-cookie +
+  токен), `POST /logout`, `GET /me`; экстрактор `CurrentUser` (Bearer/кука → `Authenticate`).
+  Write-хендлеры пока на параметрах (раскатка `CurrentUser` — 2b). Тест `auth_it` против
+  postgres зелёный (register+пароль → login → /me → logout → 401). Найден пробол: root
+  без кредов (см. ADR-0013 Consequences). ADR-0013 всё ещё Proposed.

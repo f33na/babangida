@@ -48,6 +48,9 @@ dioxus = { version = "0.6", default-features = false, features = ["macro", "html
 # cross-cutting
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# auth: хэширование паролей (argon2id) и генерация токенов сессий — на границе (ADR-0013)
+argon2 = "0.5"
+rand = "0.8"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["macros"] }

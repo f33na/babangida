@@ -71,7 +71,7 @@ async fn register_user(app: &Router, admin_id: &str, handle: &str) -> String {
     let (status, body) = post_json(
         app,
         "/register",
-        json!({ "code": code, "handle": handle, "display_name": handle, "subculture": "underground" }),
+        json!({ "code": code, "handle": handle, "display_name": handle, "subculture": "underground", "password": "memberpass1" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "регистрация {handle}: {body}");

@@ -5,14 +5,17 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use babangida_application::ApplicationError;
 use babangida_application::command::{
-    CreatePost, CreatePostCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand,
-    JoinGroup, JoinGroupCommand, LeaveGroup, LeaveGroupCommand, PostToGroup, PostToGroupCommand,
+    Authenticate, AuthenticateCommand, CreatePost, CreatePostCommand, FoundGroup,
+    FoundGroupCommand, IssueInvite, IssueInviteCommand, JoinGroup, JoinGroupCommand, LeaveGroup,
+    LeaveGroupCommand, LogIn, LogInCommand, LogOut, LogOutCommand, PostToGroup, PostToGroupCommand,
     Register, RegisterCommand, SendMessage, SendMessageCommand, SetMemberRole,
     SetMemberRoleCommand,
 };
@@ -21,18 +24,20 @@ use babangida_application::query::{
     ProfileQuery, ProfileView, RecentFeed, ThreadOf, ThreadQuery,
 };
 use babangida_domain::RepositoryError;
+use babangida_domain::auth::{AuthError, Password, SESSION_TTL, SessionToken};
 use babangida_domain::community::{
     CommunityError, GroupId, GroupKind, GroupName, GroupSlug, MembershipRole,
 };
 use babangida_domain::content::PostBody;
-use babangida_domain::identity::{Handle, InviteCode, UserId};
+use babangida_domain::identity::{Handle, InviteCode, UserId, VerifiedStatus};
 use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_infrastructure::{
-    Db, PgConversationRepository, PgFeedReadModel, PgGroupMembershipTxFactory,
-    PgGroupPostRepository, PgGroupReadModel, PgGroupRepository, PgInboxReadModel,
-    PgIssueInviteTxFactory, PgMessageRepository, PgPostRepository, PgProfileReadModel,
-    PgRegistrationTxFactory, PgThreadReadModel, RandomInviteCodeFactory, SystemClock,
+    Argon2PasswordHasher, Db, PgConversationRepository, PgCredentialRepository, PgFeedReadModel,
+    PgGroupMembershipTxFactory, PgGroupPostRepository, PgGroupReadModel, PgGroupRepository,
+    PgInboxReadModel, PgIssueInviteTxFactory, PgMessageRepository, PgPostRepository,
+    PgProfileReadModel, PgRegistrationTxFactory, PgSessionRepository, PgThreadReadModel,
+    PgUserRepository, RandomInviteCodeFactory, RandomSessionTokenFactory, SystemClock,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -48,6 +53,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/invites", post(issue_invite))
         .route("/register", post(register))
+        // auth
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/me", get(me))
         .route("/posts", post(create_post))
         .route("/profiles/{handle}", get(profile))
         .route("/feed", get(feed))
@@ -130,6 +139,54 @@ fn invalid(err: impl std::fmt::Display) -> ApiError {
     ApiError::Validation(err.to_string())
 }
 
+// --- аутентификация: текущий юзер из сессии (ADR-0013) ---
+
+/// Текущий аутентифицированный юзер, извлечённый из токена сессии
+/// (`Authorization: Bearer ...` либо кука `session`). Отсутствие, невалидность или
+/// истечение токена → 401.
+struct CurrentUser {
+    id: UserId,
+    handle: Handle,
+    verified: VerifiedStatus,
+}
+
+impl FromRequestParts<AppState> for CurrentUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Self::Rejection> {
+        let unauth = || ApiError::App(ApplicationError::Auth(AuthError::Unauthenticated));
+        let raw = token_from_headers(&parts.headers).ok_or_else(unauth)?;
+        let token = SessionToken::parse(&raw).map_err(|_| unauth())?;
+        let uc = Authenticate::new(
+            PgSessionRepository::new(st.db.clone()),
+            PgUserRepository::new(st.db.clone()),
+            SystemClock,
+        );
+        let who = uc.execute(AuthenticateCommand { token }).await?;
+        Ok(Self {
+            id: who.user,
+            handle: who.handle,
+            verified: who.verified,
+        })
+    }
+}
+
+/// Достать токен сессии из заголовков: сперва `Authorization: Bearer`, затем кука
+/// `session`.
+fn token_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(token) = auth.strip_prefix("Bearer ")
+    {
+        return Some(token.trim().to_owned());
+    }
+    let cookie = headers.get(COOKIE).and_then(|v| v.to_str().ok())?;
+    cookie
+        .split(';')
+        .filter_map(|kv| kv.trim().strip_prefix("session="))
+        .map(str::to_owned)
+        .next()
+}
+
 // --- эндпоинты ---
 
 #[derive(Deserialize)]
@@ -168,6 +225,7 @@ struct RegisterReq {
     handle: String,
     display_name: String,
     subculture: String,
+    password: String,
 }
 
 #[derive(Serialize)]
@@ -185,13 +243,99 @@ async fn register(
         handle: Handle::parse(&req.handle).map_err(invalid)?,
         display_name: DisplayName::parse(&req.display_name).map_err(invalid)?,
         subculture: Subculture::parse(&req.subculture).map_err(invalid)?,
+        password: Password::parse(&req.password).map_err(invalid)?,
     };
-    let uc = Register::new(PgRegistrationTxFactory::new(st.db.clone()), SystemClock);
+    let uc = Register::new(
+        PgRegistrationTxFactory::new(st.db.clone()),
+        Argon2PasswordHasher,
+        SystemClock,
+    );
     let user = uc.execute(cmd).await?;
     Ok(Json(RegisterRes {
         user_id: user.id().to_string(),
         handle: user.handle().as_str().to_owned(),
     }))
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    handle: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginRes {
+    token: String,
+    expires_at: i64,
+}
+
+async fn login(
+    State(st): State<AppState>,
+    Json(req): Json<LoginReq>,
+) -> Result<Response, ApiError> {
+    // Невалидный handle/пароль на входе — те же «неверные данные» (анти-энумерация).
+    let bad = || ApiError::App(ApplicationError::Auth(AuthError::InvalidCredentials));
+    let cmd = LogInCommand {
+        handle: Handle::parse(&req.handle).map_err(|_| bad())?,
+        password: Password::parse(&req.password).map_err(|_| bad())?,
+    };
+    let uc = LogIn::new(
+        PgUserRepository::new(st.db.clone()),
+        PgCredentialRepository::new(st.db.clone()),
+        PgSessionRepository::new(st.db.clone()),
+        Argon2PasswordHasher,
+        RandomSessionTokenFactory,
+        SystemClock,
+    );
+    let auth = uc.execute(cmd).await?;
+    let token = auth.token.as_str().to_owned();
+    let expires_at = auth.expires_at.into_offset().unix_timestamp();
+    let mut resp = Json(LoginRes {
+        token: token.clone(),
+        expires_at,
+    })
+    .into_response();
+    // Кука для web (HttpOnly — недоступна JS); api/mobile берут token из тела.
+    let cookie = format!(
+        "session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        SESSION_TTL.whole_seconds()
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        resp.headers_mut().insert(SET_COOKIE, value);
+    }
+    Ok(resp)
+}
+
+async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    // Идемпотентно: нет/невалиден токен — просто чистим куку.
+    if let Some(raw) = token_from_headers(&headers)
+        && let Ok(token) = SessionToken::parse(&raw)
+    {
+        LogOut::new(PgSessionRepository::new(st.db.clone()))
+            .execute(LogOutCommand { token })
+            .await?;
+    }
+    let mut resp = Json(json!({ "ok": true })).into_response();
+    resp.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_static("session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+    );
+    Ok(resp)
+}
+
+#[derive(Serialize)]
+struct MeRes {
+    user_id: String,
+    handle: String,
+    verified: bool,
+}
+
+async fn me(current: CurrentUser) -> Json<MeRes> {
+    Json(MeRes {
+        user_id: current.id.to_string(),
+        handle: current.handle.as_str().to_owned(),
+        verified: current.verified.is_verified(),
+    })
 }
 
 #[derive(Deserialize)]

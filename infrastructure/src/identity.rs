@@ -7,6 +7,7 @@ use babangida_application::{
     RegistrationTxFactory,
 };
 use babangida_domain::RepositoryError;
+use babangida_domain::auth::Credential;
 use babangida_domain::identity::{
     Handle, Invite, InviteCode, InviteQuota, InviteStatus, IssuanceContext, User, UserId, UserRole,
 };
@@ -302,6 +303,20 @@ impl RegistrationTx for PgRegistrationTx {
         .bind(profile.display_name().as_str())
         .bind(profile.subculture().as_str())
         .bind(profile.bio().map(babangida_domain::social::Bio::as_str))
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn insert_credential(&mut self, credential: &Credential) -> Result<(), RepositoryError> {
+        let tx = self.tx()?;
+        sqlx::query(
+            "INSERT INTO credentials (user_id, password_hash, established_at) VALUES ($1, $2, $3)",
+        )
+        .bind(credential.user().as_uuid())
+        .bind(credential.hash().as_str())
+        .bind(credential.established_at().into_offset())
         .execute(&mut **tx)
         .await
         .map_err(map_sqlx)?;

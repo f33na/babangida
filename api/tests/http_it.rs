@@ -80,7 +80,7 @@ async fn http_slice_end_to_end() {
     let (status, body) = post_json(
         &app,
         "/register",
-        json!({ "code": code, "handle": "newcomer", "display_name": "New Comer", "subculture": "underground" }),
+        json!({ "code": code, "handle": "newcomer", "display_name": "New Comer", "subculture": "underground", "password": "newcomerpass" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "регистрация: {body}");
@@ -90,7 +90,7 @@ async fn http_slice_end_to_end() {
     let (status, _) = post_json(
         &app,
         "/register",
-        json!({ "code": code, "handle": "latecomer", "display_name": "Late", "subculture": "hiphop" }),
+        json!({ "code": code, "handle": "latecomer", "display_name": "Late", "subculture": "hiphop", "password": "latecomerpass" }),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "код одноразовый");
@@ -124,7 +124,7 @@ async fn http_slice_end_to_end() {
     let (status, _) = post_json(
         &app,
         "/register",
-        json!({ "code": code2, "handle": "x", "display_name": "X", "subculture": "underground" }),
+        json!({ "code": code2, "handle": "x", "display_name": "X", "subculture": "underground", "password": "shorthandlepass" }),
     )
     .await;
     assert_eq!(

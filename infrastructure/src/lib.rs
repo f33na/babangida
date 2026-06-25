@@ -2,6 +2,7 @@
 //! порты. Зависимости направлены внутрь; `domain` про sqlx не знает (ADR-0003).
 //! Композиция (какой адаптер под какой порт) — в `api`. См. `../../babangida-vault/COMMON.md`.
 
+mod auth;
 mod clock;
 mod community;
 mod content;
@@ -11,6 +12,9 @@ mod invite_code;
 mod messaging;
 mod pool;
 
+pub use auth::{
+    Argon2PasswordHasher, PgCredentialRepository, PgSessionRepository, RandomSessionTokenFactory,
+};
 pub use clock::SystemClock;
 pub use community::{
     PgGroupMembershipTxFactory, PgGroupPostRepository, PgGroupReadModel, PgGroupRepository,

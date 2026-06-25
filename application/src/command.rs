@@ -123,28 +123,37 @@ where
     }
 }
 
-/// Зарегистрироваться по инвайту: создать юзера и профиль, пометить инвайт принятым.
+/// Зарегистрироваться по инвайту: создать юзера, профиль и учётные данные, пометить
+/// инвайт принятым.
 pub struct RegisterCommand {
     pub code: InviteCode,
     pub handle: Handle,
     pub display_name: DisplayName,
     pub subculture: Subculture,
+    pub password: Password,
 }
 
-/// Use-case регистрации. Атомарен: блокировка активного инвайта, создание юзера/профиля
-/// и пометка инвайта — в одной транзакции (порт [`RegistrationTxFactory`]).
-pub struct Register<T, C> {
+/// Use-case регистрации. Атомарен: блокировка активного инвайта, создание юзера/профиля/
+/// кредов и пометка инвайта — в одной транзакции (порт [`RegistrationTxFactory`]). Пароль
+/// хэшируется на границе ([`PasswordHasher`]); юзера без пароля не возникает (ADR-0013).
+pub struct Register<T, H, C> {
     tx_factory: T,
+    hasher: H,
     clock: C,
 }
 
-impl<T, C> Register<T, C>
+impl<T, H, C> Register<T, H, C>
 where
     T: RegistrationTxFactory,
+    H: PasswordHasher,
     C: Clock,
 {
-    pub fn new(tx_factory: T, clock: C) -> Self {
-        Self { tx_factory, clock }
+    pub fn new(tx_factory: T, hasher: H, clock: C) -> Self {
+        Self {
+            tx_factory,
+            hasher,
+            clock,
+        }
     }
 
     /// # Errors
@@ -162,6 +171,8 @@ where
         tx.insert_user(&user).await?;
         let profile = Profile::create(user.id(), cmd.display_name, cmd.subculture);
         tx.insert_profile(&profile).await?;
+        let credential = Credential::establish(user.id(), self.hasher.hash(&cmd.password), now);
+        tx.insert_credential(&credential).await?;
 
         invite.accept(user.id(), now)?;
         tx.mark_invite_accepted(&invite).await?;

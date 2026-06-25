@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use babangida_domain::RepositoryError;
-use babangida_domain::auth::{Password, PasswordHash, SessionToken};
+use babangida_domain::auth::{Credential, Password, PasswordHash, SessionToken};
 use babangida_domain::community::{Group, GroupId};
 use babangida_domain::identity::{Invite, InviteCode, InviteQuota, User, UserId};
 use babangida_domain::social::Profile;
@@ -90,6 +90,10 @@ pub trait RegistrationTx: Send {
 
     /// Вставить профиль нового юзера.
     async fn insert_profile(&mut self, profile: &Profile) -> Result<(), RepositoryError>;
+
+    /// Вставить учётные данные нового юзера (хэш пароля) — в той же транзакции,
+    /// чтобы не было юзера без пароля (ADR-0013).
+    async fn insert_credential(&mut self, credential: &Credential) -> Result<(), RepositoryError>;
 
     /// Пометить инвайт принятым (status + accepted_by/at).
     async fn mark_invite_accepted(&mut self, invite: &Invite) -> Result<(), RepositoryError>;
