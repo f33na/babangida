@@ -9,7 +9,9 @@ pub mod tokens;
 #[cfg(feature = "leptos")]
 mod components;
 #[cfg(feature = "leptos")]
-pub use components::{Avatar, Button, ButtonVariant, Card, FeedItem, Nav};
+pub use components::{
+    Avatar, Badge, Button, ButtonVariant, Card, FeedItem, Field, ListingCard, Nav,
+};
 
 #[cfg(feature = "dioxus")]
 mod components_dioxus;

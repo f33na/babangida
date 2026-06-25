@@ -71,3 +71,11 @@ rate-limit логина, скользящий срок сессии, хэш то
   дефолт `root`) ставит/обновляет креды сид-админа через use-case `EstablishCredential`.
   Идемпотентно; без env — no-op; нет такого админа — пропуск. Тест `bootstrap_it` против
   postgres: до bootstrap вход 401, после — 200. Теперь у `root` появляется реальный вход.
+- 2026-06-26: web-UI (Leptos SSR). Каркас сессии: `session_token()` достаёт куку `session`
+  из входящего запроса (`leptos_axum::extract::<HeaderMap>`), авторизованные server-fn шлют
+  её к api как `Authorization: Bearer` (Bearer-форвард — reqwest без фичи cookies); логин
+  пробрасывает `Set-Cookie` браузеру через `ResponseOptions`. Экраны: `/login`, фикс `/join`
+  (добавлен пароль — раньше регистрация в web была сломана), `GET /me` → текущий юзер в нав
+  (handle + verified-бейдж + выйти). Компилируется на ssr и wasm/hydrate. Полный
+  `cargo leptos build` упирается в отсутствие `wasm-bindgen-cli` в флейке (dev-тулчейн,
+  не код) — отложено, как в Prompt 3.

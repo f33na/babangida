@@ -96,3 +96,71 @@ pub fn Nav(children: Children) -> impl IntoView {
         </nav>
     }
 }
+
+/// Поле формы: лейбл над инпутом, стиль из токенов. `kind` — тип инпута
+/// (`text` по умолчанию, `password` и т.п.).
+#[component]
+pub fn Field(
+    #[prop(into)] name: String,
+    #[prop(into)] label: String,
+    #[prop(optional, into)] kind: String,
+    #[prop(optional, into)] placeholder: String,
+) -> impl IntoView {
+    let ty = if kind.is_empty() {
+        "text".to_owned()
+    } else {
+        kind
+    };
+    view! {
+        <label class="flex flex-col gap-1 text-sm text-[var(--text-muted)]">
+            {label}
+            <input
+                name=name
+                type=ty
+                placeholder=placeholder
+                class="px-3 py-2 bg-[var(--surface-raised)] border border-[var(--border)] \
+                       rounded-[var(--radius)] text-[var(--text)] placeholder:text-[var(--text-muted)]"
+            />
+        </label>
+    }
+}
+
+/// Бейдж-чип (метка статуса/роли). `accent=true` — акцентный фон, иначе приглушённый.
+#[component]
+pub fn Badge(#[prop(optional)] accent: bool, children: Children) -> impl IntoView {
+    let cls = if accent {
+        "inline-block px-2 py-0.5 rounded-[var(--radius)] text-xs font-semibold \
+         bg-[var(--accent)] text-[var(--accent-contrast)]"
+    } else {
+        "inline-block px-2 py-0.5 rounded-[var(--radius)] text-xs font-semibold \
+         bg-[var(--surface-raised)] text-[var(--text-muted)] border border-[var(--border)]"
+    };
+    view! { <span class=cls>{children()}</span> }
+}
+
+/// Карточка товара барахолки: заголовок, цена в рублях, продавец, статус (если не активен).
+#[component]
+pub fn ListingCard(
+    #[prop(into)] title: String,
+    #[prop(into)] seller_handle: String,
+    price: u64,
+    #[prop(into)] status: String,
+) -> impl IntoView {
+    let sold_or_withdrawn = status != "active";
+    view! {
+        <div class="bg-[var(--surface)] border border-[var(--border)] rounded-[var(--radius-lg)] \
+                    p-4 flex flex-col gap-1">
+            <div class="flex items-start justify-between gap-3">
+                <span class="font-semibold text-[var(--text)] break-words">{title}</span>
+                <span class="font-bold text-[var(--accent)] whitespace-nowrap">
+                    {price}" ₽"
+                </span>
+            </div>
+            <div class="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+                "@"{seller_handle}
+                {sold_or_withdrawn
+                    .then(|| view! { <Badge>{status.clone()}</Badge> })}
+            </div>
+        </div>
+    }
+}
