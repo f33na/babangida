@@ -19,7 +19,8 @@ use babangida_domain::social::{DisplayName, Profile, Subculture};
 use babangida_shared::Id;
 
 use crate::{
-    ApplicationError, Clock, InviteCodeFactory, IssueInviteTxFactory, RegistrationTxFactory,
+    ApplicationError, Clock, GroupMembershipTxFactory, InviteCodeFactory, IssueInviteTxFactory,
+    RegistrationTxFactory,
 };
 
 /// Выдать инвайт от имени юзера.
@@ -240,7 +241,12 @@ where
                 let (opened, _) =
                     Conversation::open(ConversationId::generate(), cmd.author, cmd.recipient, now)?;
                 self.conversations.save(&opened).await?;
-                opened
+                // Перечитываем: при гонке создания `save` мог не вставить наш диалог
+                // (UNIQUE на паре), и сообщение должно лечь в канонический диалог.
+                self.conversations
+                    .find_between(cmd.author, cmd.recipient)
+                    .await?
+                    .ok_or(ApplicationError::NotFound("conversation"))?
             }
         };
         let (message, event) =
@@ -292,28 +298,30 @@ pub struct JoinGroupCommand {
     pub user: UserId,
 }
 
-/// Use-case вступления. Решение (можно ли вступить, не дубль ли) принимает домен
-/// ([`Group::join`]).
-pub struct JoinGroup<G, C> {
-    groups: G,
+/// Use-case вступления. Атомарен (ADR-0012): группа блокируется на время чтения,
+/// доменного решения ([`Group::join`]) и записи — иначе параллельные изменения
+/// состава теряются. Решение (можно ли вступить, не дубль ли) принимает домен.
+pub struct JoinGroup<T, C> {
+    tx_factory: T,
     clock: C,
 }
 
-impl<G: GroupRepository, C: Clock> JoinGroup<G, C> {
-    pub fn new(groups: G, clock: C) -> Self {
-        Self { groups, clock }
+impl<T: GroupMembershipTxFactory, C: Clock> JoinGroup<T, C> {
+    pub fn new(tx_factory: T, clock: C) -> Self {
+        Self { tx_factory, clock }
     }
 
     /// # Errors
     /// [`ApplicationError`]: группы нет, вступление закрыто/уже участник, сбой хранилища.
     pub async fn execute(&self, cmd: JoinGroupCommand) -> Result<MemberJoined, ApplicationError> {
-        let mut group = self
-            .groups
-            .find_by_id(cmd.group)
+        let mut tx = self.tx_factory.begin().await?;
+        let mut group = tx
+            .lock_group(cmd.group)
             .await?
             .ok_or(ApplicationError::NotFound("group"))?;
         let event = group.join(cmd.user, self.clock.now())?;
-        self.groups.save(&group).await?;
+        tx.save(&group).await?;
+        tx.commit().await?;
         Ok(event)
     }
 }
@@ -324,28 +332,29 @@ pub struct LeaveGroupCommand {
     pub user: UserId,
 }
 
-/// Use-case выхода. Инвариант «нельзя оставить группу без владельца» — в домене
-/// ([`Group::leave`]).
-pub struct LeaveGroup<G, C> {
-    groups: G,
+/// Use-case выхода. Атомарен (ADR-0012): блокировка группы держит инвариант
+/// «нельзя оставить группу без владельца» ([`Group::leave`]) под конкуренцией.
+pub struct LeaveGroup<T, C> {
+    tx_factory: T,
     clock: C,
 }
 
-impl<G: GroupRepository, C: Clock> LeaveGroup<G, C> {
-    pub fn new(groups: G, clock: C) -> Self {
-        Self { groups, clock }
+impl<T: GroupMembershipTxFactory, C: Clock> LeaveGroup<T, C> {
+    pub fn new(tx_factory: T, clock: C) -> Self {
+        Self { tx_factory, clock }
     }
 
     /// # Errors
     /// [`ApplicationError`]: группы нет, не участник, единственный владелец, сбой хранилища.
     pub async fn execute(&self, cmd: LeaveGroupCommand) -> Result<MemberLeft, ApplicationError> {
-        let mut group = self
-            .groups
-            .find_by_id(cmd.group)
+        let mut tx = self.tx_factory.begin().await?;
+        let mut group = tx
+            .lock_group(cmd.group)
             .await?
             .ok_or(ApplicationError::NotFound("group"))?;
         let event = group.leave(cmd.user, self.clock.now())?;
-        self.groups.save(&group).await?;
+        tx.save(&group).await?;
+        tx.commit().await?;
         Ok(event)
     }
 }
@@ -358,16 +367,16 @@ pub struct SetMemberRoleCommand {
     pub role: MembershipRole,
 }
 
-/// Use-case смены роли. Права и инвариант последнего владельца — в домене
-/// ([`Group::set_role`]).
-pub struct SetMemberRole<G, C> {
-    groups: G,
+/// Use-case смены роли. Атомарен (ADR-0012): блокировка группы сериализует смены
+/// ролей; права и инвариант последнего владельца — в домене ([`Group::set_role`]).
+pub struct SetMemberRole<T, C> {
+    tx_factory: T,
     clock: C,
 }
 
-impl<G: GroupRepository, C: Clock> SetMemberRole<G, C> {
-    pub fn new(groups: G, clock: C) -> Self {
-        Self { groups, clock }
+impl<T: GroupMembershipTxFactory, C: Clock> SetMemberRole<T, C> {
+    pub fn new(tx_factory: T, clock: C) -> Self {
+        Self { tx_factory, clock }
     }
 
     /// # Errors
@@ -377,13 +386,14 @@ impl<G: GroupRepository, C: Clock> SetMemberRole<G, C> {
         &self,
         cmd: SetMemberRoleCommand,
     ) -> Result<MemberRoleChanged, ApplicationError> {
-        let mut group = self
-            .groups
-            .find_by_id(cmd.group)
+        let mut tx = self.tx_factory.begin().await?;
+        let mut group = tx
+            .lock_group(cmd.group)
             .await?
             .ok_or(ApplicationError::NotFound("group"))?;
         let event = group.set_role(cmd.actor, cmd.target, cmd.role, self.clock.now())?;
-        self.groups.save(&group).await?;
+        tx.save(&group).await?;
+        tx.commit().await?;
         Ok(event)
     }
 }
@@ -401,7 +411,7 @@ mod tests {
     use babangida_shared::{Duration, Timestamp};
 
     use super::*;
-    use crate::{InviterIssuanceState, IssueInviteTx};
+    use crate::{GroupMembershipTx, GroupMembershipTxFactory, InviterIssuanceState, IssueInviteTx};
 
     struct FixedClock(Timestamp);
     impl Clock for FixedClock {
@@ -710,33 +720,61 @@ mod tests {
     }
 
     // --- community фейки + тесты ---
+    // FoundGroup пишет через GroupRepository (вставка нового сообщества).
     struct FakeGroups {
-        group: Mutex<Option<Group>>,
+        saved: Mutex<Option<Group>>,
     }
     impl FakeGroups {
-        fn with(group: Group) -> Self {
+        fn new() -> Self {
             Self {
-                group: Mutex::new(Some(group)),
-            }
-        }
-        fn empty() -> Self {
-            Self {
-                group: Mutex::new(None),
+                saved: Mutex::new(None),
             }
         }
     }
     #[async_trait]
     impl GroupRepository for FakeGroups {
         async fn find_by_id(&self, _id: GroupId) -> Result<Option<Group>, RepositoryError> {
-            Ok(self.group.lock().unwrap().clone())
+            Ok(self.saved.lock().unwrap().clone())
         }
         async fn find_by_slug(&self, _slug: &GroupSlug) -> Result<Option<Group>, RepositoryError> {
-            Ok(self.group.lock().unwrap().clone())
+            Ok(self.saved.lock().unwrap().clone())
         }
         async fn save(&self, group: &Group) -> Result<(), RepositoryError> {
-            *self.group.lock().unwrap() = Some(group.clone());
+            *self.saved.lock().unwrap() = Some(group.clone());
             Ok(())
         }
+    }
+
+    // Членство (join/leave/set_role) идёт через транзакцию с блокировкой группы.
+    #[derive(Clone)]
+    struct FakeMembershipState {
+        group: Arc<Mutex<Option<Group>>>,
+    }
+    struct FakeMembershipTx(FakeMembershipState);
+    #[async_trait]
+    impl GroupMembershipTx for FakeMembershipTx {
+        async fn lock_group(&mut self, _id: GroupId) -> Result<Option<Group>, RepositoryError> {
+            Ok(self.0.group.lock().unwrap().clone())
+        }
+        async fn save(&mut self, group: &Group) -> Result<(), RepositoryError> {
+            *self.0.group.lock().unwrap() = Some(group.clone());
+            Ok(())
+        }
+        async fn commit(&mut self) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+    struct FakeMembershipFactory(FakeMembershipState);
+    #[async_trait]
+    impl GroupMembershipTxFactory for FakeMembershipFactory {
+        async fn begin(&self) -> Result<Box<dyn GroupMembershipTx>, RepositoryError> {
+            Ok(Box::new(FakeMembershipTx(self.0.clone())))
+        }
+    }
+    fn membership(group: Option<Group>) -> FakeMembershipFactory {
+        FakeMembershipFactory(FakeMembershipState {
+            group: Arc::new(Mutex::new(group)),
+        })
     }
 
     fn public_group(owner: UserId) -> Group {
@@ -753,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn found_group_makes_founder_owner() {
-        let uc = FoundGroup::new(FakeGroups::empty(), FixedClock(Timestamp::now()));
+        let uc = FoundGroup::new(FakeGroups::new(), FixedClock(Timestamp::now()));
         let founder = Id::generate();
         let group = uc
             .execute(FoundGroupCommand {
@@ -770,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn join_public_group_succeeds() {
         let uc = JoinGroup::new(
-            FakeGroups::with(public_group(Id::generate())),
+            membership(Some(public_group(Id::generate()))),
             FixedClock(Timestamp::now()),
         );
         let user = Id::generate();
@@ -786,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_missing_group_is_not_found() {
-        let uc = JoinGroup::new(FakeGroups::empty(), FixedClock(Timestamp::now()));
+        let uc = JoinGroup::new(membership(None), FixedClock(Timestamp::now()));
         let err = uc
             .execute(JoinGroupCommand {
                 group: Id::generate(),
@@ -801,7 +839,7 @@ mod tests {
     async fn set_role_by_non_owner_is_rejected() {
         let owner = Id::generate();
         let uc = SetMemberRole::new(
-            FakeGroups::with(public_group(owner)),
+            membership(Some(public_group(owner))),
             FixedClock(Timestamp::now()),
         );
         let err = uc
@@ -823,7 +861,7 @@ mod tests {
     async fn leave_sole_owner_is_rejected() {
         let owner = Id::generate();
         let uc = LeaveGroup::new(
-            FakeGroups::with(public_group(owner)),
+            membership(Some(public_group(owner))),
             FixedClock(Timestamp::now()),
         );
         let err = uc

@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use babangida_domain::RepositoryError;
+use babangida_domain::community::{Group, GroupId};
 use babangida_domain::identity::{Invite, InviteCode, InviteQuota, User, UserId};
 use babangida_domain::social::Profile;
 use babangida_shared::Timestamp;
@@ -83,4 +84,25 @@ pub trait RegistrationTx: Send {
 #[async_trait]
 pub trait RegistrationTxFactory: Send + Sync {
     async fn begin(&self) -> Result<Box<dyn RegistrationTx>, RepositoryError>;
+}
+
+/// Транзакция изменения членства/ролей в сообществе (ADR-0012, по образцу ADR-0011).
+/// Блокирует строку группы (`SELECT ... FOR UPDATE`), отдаёт текущий агрегат,
+/// принимает изменённый и фиксирует — чтобы инвариант «всегда есть владелец»
+/// держался под конкуренцией (иначе два параллельных выхода/смены ролей могут
+/// оставить группу без владельца).
+#[async_trait]
+pub trait GroupMembershipTx: Send {
+    /// Заблокировать группу и вернуть её агрегат (с участниками). `None` — группы нет.
+    async fn lock_group(&mut self, id: GroupId) -> Result<Option<Group>, RepositoryError>;
+    /// Сохранить изменённый состав/роли в рамках транзакции.
+    async fn save(&mut self, group: &Group) -> Result<(), RepositoryError>;
+    /// Зафиксировать транзакцию.
+    async fn commit(&mut self) -> Result<(), RepositoryError>;
+}
+
+/// Фабрика транзакций членства.
+#[async_trait]
+pub trait GroupMembershipTxFactory: Send + Sync {
+    async fn begin(&self) -> Result<Box<dyn GroupMembershipTx>, RepositoryError>;
 }

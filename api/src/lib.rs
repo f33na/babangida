@@ -11,20 +11,27 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use babangida_application::ApplicationError;
 use babangida_application::command::{
-    CreatePost, CreatePostCommand, IssueInvite, IssueInviteCommand, Register, RegisterCommand,
+    CreatePost, CreatePostCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand,
+    JoinGroup, JoinGroupCommand, LeaveGroup, LeaveGroupCommand, Register, RegisterCommand,
+    SendMessage, SendMessageCommand, SetMemberRole, SetMemberRoleCommand,
 };
 use babangida_application::query::{
-    FeedQuery, ProfileByHandle, ProfileQuery, ProfileView, RecentFeed,
+    FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf, InboxQuery, ProfileByHandle,
+    ProfileQuery, ProfileView, RecentFeed, ThreadOf, ThreadQuery,
 };
 use babangida_domain::RepositoryError;
-use babangida_domain::community::CommunityError;
+use babangida_domain::community::{
+    CommunityError, GroupId, GroupKind, GroupName, GroupSlug, MembershipRole,
+};
 use babangida_domain::content::PostBody;
 use babangida_domain::identity::{Handle, InviteCode, UserId};
-use babangida_domain::messaging::MessagingError;
+use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_infrastructure::{
-    Db, PgFeedReadModel, PgIssueInviteTxFactory, PgPostRepository, PgProfileReadModel,
-    PgRegistrationTxFactory, RandomInviteCodeFactory, SystemClock,
+    Db, PgConversationRepository, PgFeedReadModel, PgGroupMembershipTxFactory, PgGroupReadModel,
+    PgGroupRepository, PgInboxReadModel, PgIssueInviteTxFactory, PgMessageRepository,
+    PgPostRepository, PgProfileReadModel, PgRegistrationTxFactory, PgThreadReadModel,
+    RandomInviteCodeFactory, SystemClock,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -43,6 +50,16 @@ pub fn router(state: AppState) -> Router {
         .route("/posts", post(create_post))
         .route("/profiles/{handle}", get(profile))
         .route("/feed", get(feed))
+        // messaging
+        .route("/messages", post(send_message))
+        .route("/inbox", get(inbox))
+        .route("/conversations/{id}/thread", get(thread))
+        // community (карточка — по слагу; членские действия — по id)
+        .route("/groups", post(found_group))
+        .route("/groups/{slug}", get(group_view))
+        .route("/groups/{id}/join", post(join_group))
+        .route("/groups/{id}/leave", post(leave_group))
+        .route("/groups/{id}/role", post(set_role))
         .with_state(state)
 }
 
@@ -268,4 +285,256 @@ async fn feed(
         })
         .collect();
     Ok(Json(out))
+}
+
+// --- messaging ---
+
+#[derive(Deserialize)]
+struct SendMessageReq {
+    author: String,
+    recipient: String,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct SendMessageRes {
+    message_id: String,
+    conversation_id: String,
+    sent_at: i64,
+}
+
+async fn send_message(
+    State(st): State<AppState>,
+    Json(req): Json<SendMessageReq>,
+) -> Result<Json<SendMessageRes>, ApiError> {
+    let cmd = SendMessageCommand {
+        author: UserId::parse(&req.author).map_err(invalid)?,
+        recipient: UserId::parse(&req.recipient).map_err(invalid)?,
+        body: MessageBody::parse(&req.body).map_err(invalid)?,
+    };
+    let uc = SendMessage::new(
+        PgConversationRepository::new(st.db.clone()),
+        PgMessageRepository::new(st.db.clone()),
+        SystemClock,
+    );
+    let event = uc.execute(cmd).await?;
+    Ok(Json(SendMessageRes {
+        message_id: event.message_id.to_string(),
+        conversation_id: event.conversation.to_string(),
+        sent_at: event.sent_at.into_offset().unix_timestamp(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct InboxParams {
+    user: String,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ConversationRes {
+    conversation_id: String,
+    counterpart_handle: String,
+    last_message: String,
+    last_at: i64,
+}
+
+async fn inbox(
+    State(st): State<AppState>,
+    Query(params): Query<InboxParams>,
+) -> Result<Json<Vec<ConversationRes>>, ApiError> {
+    let user = UserId::parse(&params.user).map_err(invalid)?;
+    let uc = InboxQuery::new(PgInboxReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(InboxOf {
+            user,
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    let out = items
+        .into_iter()
+        .map(|c| ConversationRes {
+            conversation_id: c.conversation_id.to_string(),
+            counterpart_handle: c.counterpart_handle,
+            last_message: c.last_message,
+            last_at: c.last_at.into_offset().unix_timestamp(),
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct ThreadParams {
+    viewer: String,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct MessageRes {
+    message_id: String,
+    author_handle: String,
+    body: String,
+    sent_at: i64,
+}
+
+async fn thread(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<ThreadParams>,
+) -> Result<Json<Vec<MessageRes>>, ApiError> {
+    let conversation = ConversationId::parse(&id).map_err(invalid)?;
+    let viewer = UserId::parse(&params.viewer).map_err(invalid)?;
+    let uc = ThreadQuery::new(PgThreadReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(ThreadOf {
+            conversation,
+            viewer,
+            limit: params.limit.unwrap_or(100),
+        })
+        .await?;
+    let out = items
+        .into_iter()
+        .map(|m| MessageRes {
+            message_id: m.message_id.to_string(),
+            author_handle: m.author_handle,
+            body: m.body,
+            sent_at: m.sent_at.into_offset().unix_timestamp(),
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+// --- community ---
+
+#[derive(Deserialize)]
+struct FoundGroupReq {
+    founder: String,
+    slug: String,
+    name: String,
+    kind: String,
+}
+
+#[derive(Serialize)]
+struct FoundGroupRes {
+    group_id: String,
+    slug: String,
+}
+
+async fn found_group(
+    State(st): State<AppState>,
+    Json(req): Json<FoundGroupReq>,
+) -> Result<Json<FoundGroupRes>, ApiError> {
+    let cmd = FoundGroupCommand {
+        founder: UserId::parse(&req.founder).map_err(invalid)?,
+        slug: GroupSlug::parse(&req.slug).map_err(invalid)?,
+        name: GroupName::parse(&req.name).map_err(invalid)?,
+        kind: GroupKind::parse(&req.kind).map_err(invalid)?,
+    };
+    let uc = FoundGroup::new(PgGroupRepository::new(st.db.clone()), SystemClock);
+    let group = uc.execute(cmd).await?;
+    Ok(Json(FoundGroupRes {
+        group_id: group.id().to_string(),
+        slug: group.slug().as_str().to_owned(),
+    }))
+}
+
+#[derive(Serialize)]
+struct GroupRes {
+    group_id: String,
+    slug: String,
+    name: String,
+    kind: String,
+    member_count: u32,
+}
+
+impl From<GroupView> for GroupRes {
+    fn from(v: GroupView) -> Self {
+        Self {
+            group_id: v.group_id.to_string(),
+            slug: v.slug,
+            name: v.name,
+            kind: v.kind,
+            member_count: v.member_count,
+        }
+    }
+}
+
+async fn group_view(
+    State(st): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<GroupRes>, ApiError> {
+    let uc = GroupQuery::new(PgGroupReadModel::new(st.db.clone()));
+    let view = uc.execute(GroupBySlug { slug }).await?;
+    Ok(Json(view.into()))
+}
+
+#[derive(Deserialize)]
+struct MemberReq {
+    user: String,
+}
+
+#[derive(Serialize)]
+struct MembershipRes {
+    group_id: String,
+    user: String,
+    role: String,
+}
+
+async fn join_group(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<MemberReq>,
+) -> Result<Json<MembershipRes>, ApiError> {
+    let group = GroupId::parse(&id).map_err(invalid)?;
+    let user = UserId::parse(&req.user).map_err(invalid)?;
+    let uc = JoinGroup::new(PgGroupMembershipTxFactory::new(st.db.clone()), SystemClock);
+    let event = uc.execute(JoinGroupCommand { group, user }).await?;
+    Ok(Json(MembershipRes {
+        group_id: event.group.to_string(),
+        user: event.user.to_string(),
+        role: event.role.as_str().to_owned(),
+    }))
+}
+
+async fn leave_group(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<MemberReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let group = GroupId::parse(&id).map_err(invalid)?;
+    let user = UserId::parse(&req.user).map_err(invalid)?;
+    let uc = LeaveGroup::new(PgGroupMembershipTxFactory::new(st.db.clone()), SystemClock);
+    let event = uc.execute(LeaveGroupCommand { group, user }).await?;
+    Ok(Json(json!({
+        "group_id": event.group.to_string(),
+        "user": event.user.to_string(),
+        "left": true,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SetRoleReq {
+    actor: String,
+    target: String,
+    role: String,
+}
+
+async fn set_role(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SetRoleReq>,
+) -> Result<Json<MembershipRes>, ApiError> {
+    let cmd = SetMemberRoleCommand {
+        group: GroupId::parse(&id).map_err(invalid)?,
+        actor: UserId::parse(&req.actor).map_err(invalid)?,
+        target: UserId::parse(&req.target).map_err(invalid)?,
+        role: MembershipRole::parse(&req.role).map_err(invalid)?,
+    };
+    let uc = SetMemberRole::new(PgGroupMembershipTxFactory::new(st.db.clone()), SystemClock);
+    let event = uc.execute(cmd).await?;
+    Ok(Json(MembershipRes {
+        group_id: event.group.to_string(),
+        user: event.user.to_string(),
+        role: event.new_role.as_str().to_owned(),
+    }))
 }
