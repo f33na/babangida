@@ -54,11 +54,14 @@
           '';
         };
 
-        # Шаблон CI: одна команда — fmt + clippy + check + test. CI и локально: `nix run .#ci`.
+        # Шаблон CI: одна команда — fmt + clippy + check + test (включая интеграционные
+        # тесты против локального postgres). CI и локально: `nix run .#ci`.
         ci = pkgs.writeShellApplication {
           name = "ci";
-          runtimeInputs = [ rustToolchain ];
+          runtimeInputs = [ rustToolchain postgres pgStart ];
           text = ''
+            export DATABASE_URL="${databaseUrl}"
+            pg-start
             cargo fmt --all -- --check
             cargo clippy --workspace --all-targets -- -D warnings
             cargo check --workspace

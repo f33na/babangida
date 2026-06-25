@@ -10,8 +10,20 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# Адаптеры (postgres/sqlx и т.п.) реализуют доменные порты. sqlx добавляется,
-# когда появляется первая реализация репозитория — пока крейт пустой.
+# Адаптеры (postgres/sqlx) реализуют доменные порты (ADR-0003). Runtime-API sqlx
+# (без compile-time макросов) — `cargo check`/CI зелёные без БД; SQL проверяют
+# интеграционные тесты против БД из nix (ADR-0009).
 babangida-application.workspace = true
 babangida-domain.workspace = true
+babangida-shared.workspace = true
+sqlx.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+sqlx.workspace = true
+babangida-domain.workspace = true
+babangida-application.workspace = true
 babangida-shared.workspace = true
