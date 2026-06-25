@@ -9,9 +9,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Нативный шелл: рендерер `mobile` (webview через wry/tao) под iOS. Требует
+# device-тулчейн (Xcode/`dx`), поэтому НЕ в default — `cargo check --workspace`
+# собирает только UI-ядро. Собирать реальный app — `dx build` (ADR-0007).
+shell = ["dioxus/mobile", "dioxus/launch"]
+
 [dependencies]
-# Dioxus + нативный шелл (ADR-0007, самая рискованная ставка). Шарит `domain` и
-# `uikit`. dioxus и нативный тулчейн добавятся с первым виджетом.
+# Dioxus + нативный шелл (ADR-0007, самая рискованная ставка). Шарит `domain`,
+# `shared` и `uikit` (токены + Dioxus-виджеты под фичей `dioxus`).
 babangida-domain.workspace = true
-babangida-uikit.workspace = true
+babangida-uikit = { workspace = true, features = ["dioxus"] }
 babangida-shared.workspace = true
+dioxus.workspace = true
