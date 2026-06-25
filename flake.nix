@@ -83,6 +83,9 @@
             pkgs.cargo-leptos
             pkgs.tailwindcss
             pkgs.binaryen
+            # генерация JS/WASM-бандла; версия обязана совпадать с крейтом wasm-bindgen
+            # (закреплён в Cargo.toml под версию из nixpkgs).
+            pkgs.wasm-bindgen-cli
           ];
 
           shellHook = ''

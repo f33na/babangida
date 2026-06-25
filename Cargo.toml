@@ -38,7 +38,9 @@ leptos = "0.7"
 leptos_meta = "0.7"
 leptos_router = "0.7"
 leptos_axum = "0.7"
-wasm-bindgen = "0.2"
+# Закреплено на версию из nixpkgs (wasm-bindgen-cli), т.к. cargo-leptos требует
+# точного совпадения версий крейта и CLI. Поднимать вместе с nixpkgs.
+wasm-bindgen = "=0.2.121"
 console_error_panic_hook = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Базовый dioxus — ядро без рендерера (rsx!/компоненты/сигналы), собирается на любом
