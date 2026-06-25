@@ -32,8 +32,13 @@ target: 2026-07-10
 
 ## Implementation
 
-PR: _в работе на ветке `feat/identity-invites`_.
+Ветка `feat/identity-invites` (PR появится с remote). Сквозной срез реализован:
+`infrastructure` (sqlx, atomic issuance/registration) + `api` (axum) + миграции.
 
 ## Log
 
-- 2026-06-25: создано; идёт реализация infrastructure (sqlx) + api (axum).
+- 2026-06-25: создано.
+- 2026-06-25: domain+application (Prompt 1).
+- 2026-06-25: infrastructure + api; сквозной HTTP-тест против БD из nix зелёный
+  (выдача → регистрация → профиль → пост → лента; квота/кулдаун держатся — ADR-0011).
+  Статус остаётся `in-progress` до ревью/мерджа.

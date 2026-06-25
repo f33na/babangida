@@ -2,12 +2,17 @@
 //! проходит через доменные инварианты — лимиты и кулдаун проверяет `domain`
 //! ([`Invite::issue`]/[`Invite::accept`]), а не хендлеры.
 
+use babangida_domain::content::{Post, PostBody, PostRepository};
 use babangida_domain::identity::{
-    Invite, InviteAccepted, InviteCode, InviteId, InviteIssued, InviteRepository, IssuanceContext,
-    UserId,
+    Handle, Invite, InviteAccepted, InviteCode, InviteId, InviteIssued, InviteRepository,
+    IssuanceContext, User, UserId, UserRole,
 };
+use babangida_domain::social::{DisplayName, Profile, Subculture};
+use babangida_shared::Id;
 
-use crate::{ApplicationError, Clock, InviteCodeFactory, IssueInviteTxFactory};
+use crate::{
+    ApplicationError, Clock, InviteCodeFactory, IssueInviteTxFactory, RegistrationTxFactory,
+};
 
 /// Выдать инвайт от имени юзера.
 pub struct IssueInviteCommand {
@@ -105,6 +110,83 @@ where
     }
 }
 
+/// Зарегистрироваться по инвайту: создать юзера и профиль, пометить инвайт принятым.
+pub struct RegisterCommand {
+    pub code: InviteCode,
+    pub handle: Handle,
+    pub display_name: DisplayName,
+    pub subculture: Subculture,
+}
+
+/// Use-case регистрации. Атомарен: блокировка активного инвайта, создание юзера/профиля
+/// и пометка инвайта — в одной транзакции (порт [`RegistrationTxFactory`]).
+pub struct Register<T, C> {
+    tx_factory: T,
+    clock: C,
+}
+
+impl<T, C> Register<T, C>
+where
+    T: RegistrationTxFactory,
+    C: Clock,
+{
+    pub fn new(tx_factory: T, clock: C) -> Self {
+        Self { tx_factory, clock }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: инвайт не найден/не активен, handle занят (`Conflict`),
+    /// либо сбой хранилища.
+    pub async fn execute(&self, cmd: RegisterCommand) -> Result<User, ApplicationError> {
+        let now = self.clock.now();
+        let mut tx = self.tx_factory.begin().await?;
+        let mut invite = tx
+            .take_active_invite(&cmd.code)
+            .await?
+            .ok_or(ApplicationError::NotFound("invite"))?;
+
+        let user = User::register(Id::generate(), cmd.handle, UserRole::Member, now);
+        tx.insert_user(&user).await?;
+        let profile = Profile::create(user.id(), cmd.display_name, cmd.subculture);
+        tx.insert_profile(&profile).await?;
+
+        invite.accept(user.id(), now)?;
+        tx.mark_invite_accepted(&invite).await?;
+        tx.commit().await?;
+        Ok(user)
+    }
+}
+
+/// Опубликовать пост.
+pub struct CreatePostCommand {
+    pub author: UserId,
+    pub body: PostBody,
+}
+
+/// Use-case публикации поста.
+pub struct CreatePost<P, C> {
+    posts: P,
+    clock: C,
+}
+
+impl<P, C> CreatePost<P, C>
+where
+    P: PostRepository,
+    C: Clock,
+{
+    pub fn new(posts: P, clock: C) -> Self {
+        Self { posts, clock }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое хранилища.
+    pub async fn execute(&self, cmd: CreatePostCommand) -> Result<Post, ApplicationError> {
+        let post = Post::create(Id::generate(), cmd.author, cmd.body, self.clock.now());
+        self.posts.save(&post).await?;
+        Ok(post)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,7 +195,7 @@ mod tests {
     use async_trait::async_trait;
     use babangida_domain::RepositoryError;
     use babangida_domain::identity::{InviteError, InviteQuota};
-    use babangida_shared::{Duration, Id, Timestamp};
+    use babangida_shared::{Duration, Timestamp};
 
     use super::*;
     use crate::{InviterIssuanceState, IssueInviteTx};

@@ -14,4 +14,5 @@ pub mod query;
 pub use error::ApplicationError;
 pub use ports::{
     Clock, InviteCodeFactory, InviterIssuanceState, IssueInviteTx, IssueInviteTxFactory,
+    RegistrationTx, RegistrationTxFactory,
 };

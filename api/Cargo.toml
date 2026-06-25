@@ -10,8 +10,22 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# Точка композиции (axum появится с первым хендлером). Доменные правила вызывает,
-# не дублирует — см. ADR-0003/0004.
+# Точка композиции зависимостей (ADR-0003/0004): собирает адаптеры infrastructure
+# под порты application. Доменные правила вызывает, не дублирует.
 babangida-application.workspace = true
+babangida-domain.workspace = true
+babangida-infrastructure.workspace = true
+babangida-shared.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["net"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+tokio.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+babangida-infrastructure.workspace = true
 babangida-domain.workspace = true
 babangida-shared.workspace = true

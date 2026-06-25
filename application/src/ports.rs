@@ -3,7 +3,8 @@
 
 use async_trait::async_trait;
 use babangida_domain::RepositoryError;
-use babangida_domain::identity::{Invite, InviteCode, InviteQuota, UserId};
+use babangida_domain::identity::{Invite, InviteCode, InviteQuota, User, UserId};
+use babangida_domain::social::Profile;
 use babangida_shared::Timestamp;
 
 /// Источник текущего времени (адаптер часов).
@@ -51,4 +52,35 @@ pub trait IssueInviteTx: Send {
 #[async_trait]
 pub trait IssueInviteTxFactory: Send + Sync {
     async fn begin(&self) -> Result<Box<dyn IssueInviteTx>, RepositoryError>;
+}
+
+/// Транзакция регистрации по инвайту. Всё в одной БД-транзакции: блокировка
+/// активного инвайта по коду, создание юзера и профиля, пометка инвайта принятым.
+/// Атомарно — иначе возможны полу-состояния (юзер без принятого инвайта и наоборот).
+#[async_trait]
+pub trait RegistrationTx: Send {
+    /// Заблокировать активный инвайт по коду (`SELECT ... FOR UPDATE`) и вернуть его.
+    /// `None` — кода нет или он уже не активен.
+    async fn take_active_invite(
+        &mut self,
+        code: &InviteCode,
+    ) -> Result<Option<Invite>, RepositoryError>;
+
+    /// Вставить нового юзера (нарушение уникальности handle → `Conflict`).
+    async fn insert_user(&mut self, user: &User) -> Result<(), RepositoryError>;
+
+    /// Вставить профиль нового юзера.
+    async fn insert_profile(&mut self, profile: &Profile) -> Result<(), RepositoryError>;
+
+    /// Пометить инвайт принятым (status + accepted_by/at).
+    async fn mark_invite_accepted(&mut self, invite: &Invite) -> Result<(), RepositoryError>;
+
+    /// Зафиксировать транзакцию.
+    async fn commit(&mut self) -> Result<(), RepositoryError>;
+}
+
+/// Фабрика транзакций регистрации.
+#[async_trait]
+pub trait RegistrationTxFactory: Send + Sync {
+    async fn begin(&self) -> Result<Box<dyn RegistrationTx>, RepositoryError>;
 }
