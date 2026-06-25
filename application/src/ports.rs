@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use babangida_domain::RepositoryError;
+use babangida_domain::auth::{Password, PasswordHash, SessionToken};
 use babangida_domain::community::{Group, GroupId};
 use babangida_domain::identity::{Invite, InviteCode, InviteQuota, User, UserId};
 use babangida_domain::social::Profile;
@@ -19,6 +20,23 @@ pub trait Clock: Send + Sync {
 pub trait InviteCodeFactory: Send + Sync {
     /// Сгенерировать новый валидный код.
     fn generate(&self) -> InviteCode;
+}
+
+/// Хэширование и сверка паролей (argon2 и т.п.). Тяжёлая недетерминированная
+/// операция (случайная соль) — на границе, не в домене (ADR-0013). Домен хранит
+/// только результат — [`PasswordHash`].
+pub trait PasswordHasher: Send + Sync {
+    /// Захэшировать пароль (со случайной солью).
+    fn hash(&self, password: &Password) -> PasswordHash;
+    /// Сверить пароль с хэшем (constant-time внутри адаптера).
+    fn verify(&self, password: &Password, hash: &PasswordHash) -> bool;
+}
+
+/// Генератор токенов сессий. Источник энтропии — здесь, на границе; домен токен
+/// только валидирует ([`SessionToken::parse`]).
+pub trait SessionTokenFactory: Send + Sync {
+    /// Сгенерировать новый высокоэнтропийный токен.
+    fn generate(&self) -> SessionToken;
 }
 
 /// Состояние инвайтера, прочитанное ПОД блокировкой строки (для инварианта выдачи,

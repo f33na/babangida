@@ -109,6 +109,8 @@ fn app_error_response(err: ApplicationError) -> (StatusCode, String) {
             e @ (CommunityError::TargetNotMember | CommunityError::NotMember),
         ) => (StatusCode::NOT_FOUND, e.to_string()),
         ApplicationError::Community(e) => (StatusCode::CONFLICT, e.to_string()),
+        // Аутентификация: неверные данные или нет валидной сессии — 401.
+        ApplicationError::Auth(e) => (StatusCode::UNAUTHORIZED, e.to_string()),
         ApplicationError::NotFound(what) => (StatusCode::NOT_FOUND, format!("не найдено: {what}")),
         ApplicationError::Repository(RepositoryError::NotFound) => {
             (StatusCode::NOT_FOUND, "не найдено".to_owned())

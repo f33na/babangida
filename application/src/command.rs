@@ -2,6 +2,10 @@
 //! проходит через доменные инварианты — лимиты и кулдаун проверяет `domain`
 //! ([`Invite::issue`]/[`Invite::accept`]), а не хендлеры.
 
+use babangida_domain::auth::{
+    AuthError, Credential, CredentialRepository, Password, SESSION_TTL, Session, SessionId,
+    SessionRepository, SessionToken,
+};
 use babangida_domain::community::{
     Group, GroupId, GroupKind, GroupName, GroupPostRepository, GroupRepository, GroupSlug,
     MemberJoined, MemberLeft, MemberRoleChanged, MembershipRole,
@@ -9,18 +13,18 @@ use babangida_domain::community::{
 use babangida_domain::content::{Post, PostBody, PostRepository};
 use babangida_domain::identity::{
     Handle, Invite, InviteAccepted, InviteCode, InviteId, InviteIssued, InviteRepository,
-    IssuanceContext, User, UserId, UserRole,
+    IssuanceContext, User, UserId, UserRepository, UserRole, VerifiedStatus,
 };
 use babangida_domain::messaging::{
     Conversation, ConversationId, ConversationRepository, MessageBody, MessageId,
     MessageRepository, MessageSent,
 };
 use babangida_domain::social::{DisplayName, Profile, Subculture};
-use babangida_shared::Id;
+use babangida_shared::{Id, Timestamp};
 
 use crate::{
     ApplicationError, Clock, GroupMembershipTxFactory, InviteCodeFactory, IssueInviteTxFactory,
-    RegistrationTxFactory,
+    PasswordHasher, RegistrationTxFactory, SessionTokenFactory,
 };
 
 /// Выдать инвайт от имени юзера.
@@ -439,6 +443,211 @@ impl<T: GroupMembershipTxFactory, C: Clock> SetMemberRole<T, C> {
     }
 }
 
+// --- auth: учётные данные и сессии (ADR-0013) ---
+
+/// Завести/обновить пароль юзера.
+pub struct EstablishCredentialCommand {
+    pub user: UserId,
+    pub password: Password,
+}
+
+/// Use-case установки учётных данных: хэширование — на границе ([`PasswordHasher`]),
+/// домен хранит только хэш.
+pub struct EstablishCredential<R, H, C> {
+    credentials: R,
+    hasher: H,
+    clock: C,
+}
+
+impl<R, H, C> EstablishCredential<R, H, C>
+where
+    R: CredentialRepository,
+    H: PasswordHasher,
+    C: Clock,
+{
+    pub fn new(credentials: R, hasher: H, clock: C) -> Self {
+        Self {
+            credentials,
+            hasher,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое хранилища.
+    pub async fn execute(&self, cmd: EstablishCredentialCommand) -> Result<(), ApplicationError> {
+        let hash = self.hasher.hash(&cmd.password);
+        let credential = Credential::establish(cmd.user, hash, self.clock.now());
+        self.credentials.save(&credential).await?;
+        Ok(())
+    }
+}
+
+/// Войти по handle и паролю.
+pub struct LogInCommand {
+    pub handle: Handle,
+    pub password: Password,
+}
+
+/// Результат логина: токен сессии (клиент кладёт его в куку) и момент истечения.
+#[derive(Debug)]
+pub struct Authentication {
+    pub token: SessionToken,
+    pub expires_at: Timestamp,
+}
+
+/// Use-case логина. Не различает «нет юзера»/«неверный пароль» — на оба
+/// [`AuthError::InvalidCredentials`] (анти-энумерация). Сессия — на [`SESSION_TTL`].
+pub struct LogIn<U, R, S, H, F, C> {
+    users: U,
+    credentials: R,
+    sessions: S,
+    hasher: H,
+    tokens: F,
+    clock: C,
+}
+
+impl<U, R, S, H, F, C> LogIn<U, R, S, H, F, C>
+where
+    U: UserRepository,
+    R: CredentialRepository,
+    S: SessionRepository,
+    H: PasswordHasher,
+    F: SessionTokenFactory,
+    C: Clock,
+{
+    pub fn new(users: U, credentials: R, sessions: S, hasher: H, tokens: F, clock: C) -> Self {
+        Self {
+            users,
+            credentials,
+            sessions,
+            hasher,
+            tokens,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError::Auth`] при неверных данных; иначе — сбой хранилища.
+    pub async fn execute(&self, cmd: LogInCommand) -> Result<Authentication, ApplicationError> {
+        let invalid = || ApplicationError::Auth(AuthError::InvalidCredentials);
+        let user = self
+            .users
+            .find_by_handle(&cmd.handle)
+            .await?
+            .ok_or_else(invalid)?;
+        let credential = self
+            .credentials
+            .find_by_user(user.id())
+            .await?
+            .ok_or_else(invalid)?;
+        if !self.hasher.verify(&cmd.password, credential.hash()) {
+            return Err(invalid());
+        }
+        let now = self.clock.now();
+        let token = self.tokens.generate();
+        let (session, _issued) = Session::issue(
+            SessionId::generate(),
+            token.clone(),
+            user.id(),
+            now,
+            SESSION_TTL,
+        );
+        self.sessions.save(&session).await?;
+        Ok(Authentication {
+            token,
+            expires_at: session.expires_at(),
+        })
+    }
+}
+
+/// Выйти: погасить сессию по токену.
+pub struct LogOutCommand {
+    pub token: SessionToken,
+}
+
+/// Use-case выхода. Идемпотентен: нет такой сессии — не ошибка.
+pub struct LogOut<S> {
+    sessions: S,
+}
+
+impl<S: SessionRepository> LogOut<S> {
+    pub fn new(sessions: S) -> Self {
+        Self { sessions }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое хранилища.
+    pub async fn execute(&self, cmd: LogOutCommand) -> Result<(), ApplicationError> {
+        self.sessions.delete(&cmd.token).await?;
+        Ok(())
+    }
+}
+
+/// Распознать текущего юзера по токену сессии (для middleware).
+pub struct AuthenticateCommand {
+    pub token: SessionToken,
+}
+
+/// Текущий аутентифицированный юзер. `verified` несёт гейт привилегий (ADR-0010).
+#[derive(Debug)]
+pub struct AuthenticatedUser {
+    pub user: UserId,
+    pub handle: Handle,
+    pub verified: VerifiedStatus,
+}
+
+/// Use-case распознавания сессии. Проверяет срок ([`Session::is_active`]); истёкшая
+/// или отсутствующая сессия (как и исчезнувший юзер) — [`AuthError::Unauthenticated`].
+pub struct Authenticate<S, U, C> {
+    sessions: S,
+    users: U,
+    clock: C,
+}
+
+impl<S, U, C> Authenticate<S, U, C>
+where
+    S: SessionRepository,
+    U: UserRepository,
+    C: Clock,
+{
+    pub fn new(sessions: S, users: U, clock: C) -> Self {
+        Self {
+            sessions,
+            users,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError::Auth`] (`Unauthenticated`), если сессии нет/истекла или
+    /// юзер исчез; иначе — сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: AuthenticateCommand,
+    ) -> Result<AuthenticatedUser, ApplicationError> {
+        let unauth = || ApplicationError::Auth(AuthError::Unauthenticated);
+        let session = self
+            .sessions
+            .find_by_token(&cmd.token)
+            .await?
+            .ok_or_else(unauth)?;
+        if !session.is_active(self.clock.now()) {
+            return Err(unauth());
+        }
+        let user = self
+            .users
+            .find_by_id(session.user())
+            .await?
+            .ok_or_else(unauth)?;
+        Ok(AuthenticatedUser {
+            user: user.id(),
+            handle: user.handle().clone(),
+            verified: user.verified(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -446,6 +655,7 @@ mod tests {
 
     use async_trait::async_trait;
     use babangida_domain::RepositoryError;
+    use babangida_domain::auth::PasswordHash;
     use babangida_domain::community::CommunityError;
     use babangida_domain::content::PostId;
     use babangida_domain::identity::{InviteError, InviteQuota};
@@ -985,5 +1195,282 @@ mod tests {
             ApplicationError::Community(CommunityError::NotPermitted)
         ));
         assert_eq!(published.lock().unwrap().len(), 0);
+    }
+
+    // --- auth фейки + тесты ---
+    #[derive(Clone)]
+    struct FakeCredentials {
+        stored: Arc<Mutex<Option<Credential>>>,
+    }
+    impl FakeCredentials {
+        fn empty() -> Self {
+            Self {
+                stored: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+    #[async_trait]
+    impl CredentialRepository for FakeCredentials {
+        async fn find_by_user(&self, _user: UserId) -> Result<Option<Credential>, RepositoryError> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+        async fn save(&self, credential: &Credential) -> Result<(), RepositoryError> {
+            *self.stored.lock().unwrap() = Some(credential.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeSessions {
+        stored: Arc<Mutex<Vec<Session>>>,
+    }
+    impl FakeSessions {
+        fn empty() -> Self {
+            Self {
+                stored: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+    #[async_trait]
+    impl SessionRepository for FakeSessions {
+        async fn find_by_token(
+            &self,
+            token: &SessionToken,
+        ) -> Result<Option<Session>, RepositoryError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|s| s.token() == token)
+                .cloned())
+        }
+        async fn save(&self, session: &Session) -> Result<(), RepositoryError> {
+            self.stored.lock().unwrap().push(session.clone());
+            Ok(())
+        }
+        async fn delete(&self, token: &SessionToken) -> Result<(), RepositoryError> {
+            self.stored.lock().unwrap().retain(|s| s.token() != token);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeUsers {
+        users: Vec<User>,
+    }
+    impl FakeUsers {
+        fn with(users: Vec<User>) -> Self {
+            Self { users }
+        }
+        fn none() -> Self {
+            Self { users: Vec::new() }
+        }
+    }
+    #[async_trait]
+    impl UserRepository for FakeUsers {
+        async fn find_by_id(&self, id: UserId) -> Result<Option<User>, RepositoryError> {
+            Ok(self.users.iter().find(|u| u.id() == id).cloned())
+        }
+        async fn find_by_handle(&self, handle: &Handle) -> Result<Option<User>, RepositoryError> {
+            Ok(self.users.iter().find(|u| u.handle() == handle).cloned())
+        }
+        async fn save(&self, _user: &User) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    // Детерминированный «хэш»: префикс + сам пароль. Достаточно для проверки потока.
+    #[derive(Clone, Copy)]
+    struct FakeHasher;
+    impl PasswordHasher for FakeHasher {
+        fn hash(&self, password: &Password) -> PasswordHash {
+            PasswordHash::from_storage(format!("hashed:{}", password.expose()))
+        }
+        fn verify(&self, password: &Password, hash: &PasswordHash) -> bool {
+            hash.as_str() == format!("hashed:{}", password.expose())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeTokens(SessionToken);
+    impl SessionTokenFactory for FakeTokens {
+        fn generate(&self) -> SessionToken {
+            self.0.clone()
+        }
+    }
+
+    fn auth_user() -> User {
+        User::register(
+            Id::generate(),
+            Handle::parse("mc_test").unwrap(),
+            UserRole::Member,
+            Timestamp::now(),
+        )
+    }
+    fn token() -> SessionToken {
+        SessionToken::parse(&"t".repeat(40)).unwrap()
+    }
+    fn password() -> Password {
+        Password::parse("correct horse").unwrap()
+    }
+
+    /// Установить пароль и залогиниться; вернуть общий стор сессий и результат.
+    async fn logged_in() -> (Timestamp, User, FakeSessions, Authentication) {
+        let now = Timestamp::now();
+        let user = auth_user();
+        let creds = FakeCredentials::empty();
+        EstablishCredential::new(creds.clone(), FakeHasher, FixedClock(now))
+            .execute(EstablishCredentialCommand {
+                user: user.id(),
+                password: password(),
+            })
+            .await
+            .unwrap();
+        let sessions = FakeSessions::empty();
+        let auth = LogIn::new(
+            FakeUsers::with(vec![user.clone()]),
+            creds,
+            sessions.clone(),
+            FakeHasher,
+            FakeTokens(token()),
+            FixedClock(now),
+        )
+        .execute(LogInCommand {
+            handle: user.handle().clone(),
+            password: password(),
+        })
+        .await
+        .unwrap();
+        (now, user, sessions, auth)
+    }
+
+    #[tokio::test]
+    async fn login_issues_session_on_correct_password() {
+        let (now, _user, sessions, auth) = logged_in().await;
+        assert_eq!(auth.token, token());
+        assert_eq!(auth.expires_at, now + SESSION_TTL);
+        assert_eq!(sessions.stored.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn login_with_wrong_password_is_rejected() {
+        let now = Timestamp::now();
+        let user = auth_user();
+        let creds = FakeCredentials::empty();
+        EstablishCredential::new(creds.clone(), FakeHasher, FixedClock(now))
+            .execute(EstablishCredentialCommand {
+                user: user.id(),
+                password: password(),
+            })
+            .await
+            .unwrap();
+        let sessions = FakeSessions::empty();
+        let err = LogIn::new(
+            FakeUsers::with(vec![user.clone()]),
+            creds,
+            sessions.clone(),
+            FakeHasher,
+            FakeTokens(token()),
+            FixedClock(now),
+        )
+        .execute(LogInCommand {
+            handle: user.handle().clone(),
+            password: Password::parse("wrong password").unwrap(),
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Auth(AuthError::InvalidCredentials)
+        ));
+        assert!(sessions.stored.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn login_with_unknown_handle_is_rejected() {
+        let err = LogIn::new(
+            FakeUsers::none(),
+            FakeCredentials::empty(),
+            FakeSessions::empty(),
+            FakeHasher,
+            FakeTokens(token()),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(LogInCommand {
+            handle: Handle::parse("ghost").unwrap(),
+            password: password(),
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Auth(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticate_resolves_current_user() {
+        let (now, user, sessions, auth) = logged_in().await;
+        let who = Authenticate::new(
+            sessions,
+            FakeUsers::with(vec![user.clone()]),
+            FixedClock(now),
+        )
+        .execute(AuthenticateCommand { token: auth.token })
+        .await
+        .unwrap();
+        assert_eq!(who.user, user.id());
+        assert_eq!(who.handle.as_str(), "mc_test");
+        assert_eq!(who.verified, VerifiedStatus::Casual);
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_expired_session() {
+        let (now, user, sessions, auth) = logged_in().await;
+        let later = now + SESSION_TTL + Duration::days(1);
+        let err = Authenticate::new(sessions, FakeUsers::with(vec![user]), FixedClock(later))
+            .execute(AuthenticateCommand { token: auth.token })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Auth(AuthError::Unauthenticated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_unknown_token() {
+        let err = Authenticate::new(
+            FakeSessions::empty(),
+            FakeUsers::none(),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(AuthenticateCommand { token: token() })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Auth(AuthError::Unauthenticated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_session() {
+        let (now, user, sessions, auth) = logged_in().await;
+        LogOut::new(sessions.clone())
+            .execute(LogOutCommand {
+                token: auth.token.clone(),
+            })
+            .await
+            .unwrap();
+        let err = Authenticate::new(sessions, FakeUsers::with(vec![user]), FixedClock(now))
+            .execute(AuthenticateCommand { token: auth.token })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Auth(AuthError::Unauthenticated)
+        ));
     }
 }

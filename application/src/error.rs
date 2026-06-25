@@ -1,4 +1,5 @@
 use babangida_domain::RepositoryError;
+use babangida_domain::auth::AuthError;
 use babangida_domain::community::CommunityError;
 use babangida_domain::identity::InviteError;
 use babangida_domain::messaging::MessagingError;
@@ -16,6 +17,9 @@ pub enum ApplicationError {
     /// Нарушение правила сообщества (членство, роли, права).
     #[error(transparent)]
     Community(#[from] CommunityError),
+    /// Сбой аутентификации (неверные данные или нет валидной сессии).
+    #[error(transparent)]
+    Auth(#[from] AuthError),
     /// Сбой порта-репозитория.
     #[error(transparent)]
     Repository(#[from] RepositoryError),
