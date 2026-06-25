@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — 2026-06-25 (ждёт акцепта при ревью Prompt 5)
+Accepted — 2026-06-26
 
 ## Context
 

@@ -30,7 +30,7 @@ target: 2026-07-20
 
 ## Technical
 
-Модель — [[decisions/0012-messaging-community-model]] (**Proposed**). Источник правды —
+Модель — [[decisions/0012-messaging-community-model]] (Accepted). Источник правды —
 [[decisions/0003-domain-as-source-of-truth]]; чтение — [[decisions/0004-cqrs-read-write-split]];
 соцфункции без верификации — [[decisions/0010-verification-model]]. Атомарность вступления/
 ролей под конкуренцией — по образцу [[decisions/0011-invite-issuance-atomicity]] (на HTTP-срезе).
@@ -53,3 +53,4 @@ read-модели `Inbox`/`Thread`/`Group`, tx-порт членства `GroupM
 - 2026-06-26: связь пост↔сообщество (миграция `0004` `group_posts`; `PostToGroup` +
   `Group::authorize_post`; общая лента отдаёт посты пабликов с меткой, посты закрытых
   скрыты от анонимной ленты). Агрегат `content::Post` не тронут. e2e против БД зелёный.
+- 2026-06-26: ADR-0012 акцептован (Accepted) пользователем.

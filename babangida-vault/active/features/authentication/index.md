@@ -33,7 +33,7 @@ rate-limit логина, скользящий срок сессии, хэш то
 
 ## Technical
 
-Модель — [[decisions/0013-authentication-sessions]] (**Proposed**). Источник правды и
+Модель — [[decisions/0013-authentication-sessions]] (Accepted). Источник правды и
 «хэш/токен на границе» — [[decisions/0003-domain-as-source-of-truth]]; гейт привилегий,
 который это разблокирует — [[decisions/0010-verification-model]]; атомарность кредов при
 регистрации — по образцу [[decisions/0011-invite-issuance-atomicity]].
@@ -58,3 +58,4 @@ rate-limit логина, скользящий срок сессии, хэш то
   Write-хендлеры пока на параметрах (раскатка `CurrentUser` — 2b). Тест `auth_it` против
   postgres зелёный (register+пароль → login → /me → logout → 401). Найден пробол: root
   без кредов (см. ADR-0013 Consequences). ADR-0013 всё ещё Proposed.
+- 2026-06-26: ADR-0013 акцептован (Accepted) пользователем.

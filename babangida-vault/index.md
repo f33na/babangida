@@ -24,5 +24,5 @@
 - [[decisions/0009-nix-flake-ci-db]] — Nix flake: окружение, БД, CI.
 - [[decisions/0010-verification-model]] — верификация (гейт маркета/музыки/open API).
 - [[decisions/0011-invite-issuance-atomicity]] — атомарность выдачи инвайта (tx + блокировка).
-- [[decisions/0012-messaging-community-model]] — messaging (DM) и сообщества (группы/паблики). **Proposed**.
-- [[decisions/0013-authentication-sessions]] — аутентификация и сессии (пароль + серверные токены). **Proposed**.
+- [[decisions/0012-messaging-community-model]] — messaging (DM) и сообщества (группы/паблики).
+- [[decisions/0013-authentication-sessions]] — аутентификация и сессии (пароль + серверные токены).
