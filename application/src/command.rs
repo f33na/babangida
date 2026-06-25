@@ -15,6 +15,9 @@ use babangida_domain::identity::{
     Handle, Invite, InviteAccepted, InviteCode, InviteId, InviteIssued, InviteRepository,
     IssuanceContext, User, UserId, UserRepository, UserRole, VerifiedStatus,
 };
+use babangida_domain::marketplace::{
+    Listing, ListingDraft, ListingId, ListingRepository, ListingSold, ListingWithdrawn,
+};
 use babangida_domain::messaging::{
     Conversation, ConversationId, ConversationRepository, MessageBody, MessageId,
     MessageRepository, MessageSent,
@@ -659,6 +662,167 @@ where
     }
 }
 
+// --- marketplace: барахолка + гейт верификации (ADR-0010/0014) ---
+
+/// Выставить товар на продажу.
+pub struct CreateListingCommand {
+    pub seller: UserId,
+    pub draft: ListingDraft,
+}
+
+/// Use-case выставления товара. Гейт верификации (ADR-0010): грузим продавца, читаем
+/// его статус и передаём в домен — решает [`Listing::list`]. Анти-ВК: товар живёт в
+/// маркете и профиле той же сети.
+pub struct CreateListing<U, L, C> {
+    users: U,
+    listings: L,
+    clock: C,
+}
+
+impl<U, L, C> CreateListing<U, L, C>
+where
+    U: UserRepository,
+    L: ListingRepository,
+    C: Clock,
+{
+    pub fn new(users: U, listings: L, clock: C) -> Self {
+        Self {
+            users,
+            listings,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: продавца нет, он не верифицирован (`Marketplace`), либо
+    /// сбой хранилища.
+    pub async fn execute(&self, cmd: CreateListingCommand) -> Result<Listing, ApplicationError> {
+        let seller = self
+            .users
+            .find_by_id(cmd.seller)
+            .await?
+            .ok_or(ApplicationError::NotFound("seller"))?;
+        let (listing, _event) = Listing::list(
+            Id::generate(),
+            seller.id(),
+            seller.verified(),
+            cmd.draft,
+            self.clock.now(),
+        )?;
+        self.listings.save(&listing).await?;
+        Ok(listing)
+    }
+}
+
+/// Отметить товар проданным.
+pub struct MarkListingSoldCommand {
+    pub listing: ListingId,
+    pub actor: UserId,
+}
+
+/// Use-case «продано». Право — у домена ([`Listing::mark_sold`]): только продавец,
+/// только из активного.
+pub struct MarkListingSold<L> {
+    listings: L,
+}
+
+impl<L: ListingRepository> MarkListingSold<L> {
+    pub fn new(listings: L) -> Self {
+        Self { listings }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: товара нет, не продавец, уже не активен, либо сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: MarkListingSoldCommand,
+    ) -> Result<ListingSold, ApplicationError> {
+        let mut listing = self
+            .listings
+            .find_by_id(cmd.listing)
+            .await?
+            .ok_or(ApplicationError::NotFound("listing"))?;
+        let event = listing.mark_sold(cmd.actor)?;
+        self.listings.save(&listing).await?;
+        Ok(event)
+    }
+}
+
+/// Снять товар с продажи.
+pub struct WithdrawListingCommand {
+    pub listing: ListingId,
+    pub actor: UserId,
+}
+
+/// Use-case снятия. Право — у домена ([`Listing::withdraw`]): только продавец.
+pub struct WithdrawListing<L> {
+    listings: L,
+}
+
+impl<L: ListingRepository> WithdrawListing<L> {
+    pub fn new(listings: L) -> Self {
+        Self { listings }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: товара нет, не продавец, уже не активен, либо сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: WithdrawListingCommand,
+    ) -> Result<ListingWithdrawn, ApplicationError> {
+        let mut listing = self
+            .listings
+            .find_by_id(cmd.listing)
+            .await?
+            .ok_or(ApplicationError::NotFound("listing"))?;
+        let event = listing.withdraw(cmd.actor)?;
+        self.listings.save(&listing).await?;
+        Ok(event)
+    }
+}
+
+/// Верифицировать юзера — открыть привилегированные зоны (маркет/музыка/API, ADR-0010).
+pub struct VerifyUserCommand {
+    pub actor: UserId,
+    pub target: Handle,
+}
+
+/// Use-case выдачи верификации. Ручная модерация маленькой командой (ADR-0010):
+/// выдаёт только админ. Сам статус ставит домен ([`User::verify`]).
+pub struct VerifyUser<U> {
+    users: U,
+}
+
+impl<U: UserRepository> VerifyUser<U> {
+    pub fn new(users: U) -> Self {
+        Self { users }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: актор не админ (`Forbidden`), целевого юзера нет, либо
+    /// сбой хранилища.
+    pub async fn execute(&self, cmd: VerifyUserCommand) -> Result<User, ApplicationError> {
+        let actor = self
+            .users
+            .find_by_id(cmd.actor)
+            .await?
+            .ok_or(ApplicationError::NotFound("actor"))?;
+        if actor.role() != UserRole::Admin {
+            return Err(ApplicationError::Forbidden(
+                "верифицировать может только админ",
+            ));
+        }
+        let mut target = self
+            .users
+            .find_by_handle(&cmd.target)
+            .await?
+            .ok_or(ApplicationError::NotFound("user"))?;
+        target.verify();
+        self.users.save(&target).await?;
+        Ok(target)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -670,6 +834,7 @@ mod tests {
     use babangida_domain::community::CommunityError;
     use babangida_domain::content::PostId;
     use babangida_domain::identity::{InviteError, InviteQuota};
+    use babangida_domain::marketplace::{ListingTitle, MarketplaceError, Price};
     use babangida_domain::messaging::{Message, MessagingError};
     use babangida_shared::{Duration, Timestamp};
 
@@ -1483,5 +1648,158 @@ mod tests {
             err,
             ApplicationError::Auth(AuthError::Unauthenticated)
         ));
+    }
+
+    // --- marketplace фейки + тесты ---
+    #[derive(Clone)]
+    struct FakeListings {
+        saved: Arc<Mutex<Vec<Listing>>>,
+    }
+    impl FakeListings {
+        fn empty() -> Self {
+            Self {
+                saved: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn with(listing: Listing) -> Self {
+            Self {
+                saved: Arc::new(Mutex::new(vec![listing])),
+            }
+        }
+    }
+    #[async_trait]
+    impl ListingRepository for FakeListings {
+        async fn find_by_id(&self, id: ListingId) -> Result<Option<Listing>, RepositoryError> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|l| l.id() == id)
+                .cloned())
+        }
+        async fn save(&self, listing: &Listing) -> Result<(), RepositoryError> {
+            let mut v = self.saved.lock().unwrap();
+            v.retain(|l| l.id() != listing.id());
+            v.push(listing.clone());
+            Ok(())
+        }
+    }
+
+    fn listing_draft() -> ListingDraft {
+        ListingDraft {
+            title: ListingTitle::parse("SP-404").unwrap(),
+            price: Price::parse(30000).unwrap(),
+            description: None,
+        }
+    }
+
+    fn member(handle: &str) -> User {
+        User::register(
+            Id::generate(),
+            Handle::parse(handle).unwrap(),
+            UserRole::Member,
+            Timestamp::now(),
+        )
+    }
+
+    #[tokio::test]
+    async fn casual_seller_cannot_list() {
+        let seller = member("casual_one");
+        let listings = FakeListings::empty();
+        let uc = CreateListing::new(
+            FakeUsers::with(vec![seller.clone()]),
+            listings.clone(),
+            FixedClock(Timestamp::now()),
+        );
+        let err = uc
+            .execute(CreateListingCommand {
+                seller: seller.id(),
+                draft: listing_draft(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Marketplace(MarketplaceError::NotVerified)
+        ));
+        assert!(listings.saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn verified_seller_lists() {
+        let mut seller = member("seller_one");
+        seller.verify();
+        let listings = FakeListings::empty();
+        let uc = CreateListing::new(
+            FakeUsers::with(vec![seller.clone()]),
+            listings.clone(),
+            FixedClock(Timestamp::now()),
+        );
+        let listing = uc
+            .execute(CreateListingCommand {
+                seller: seller.id(),
+                draft: listing_draft(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(listing.seller(), seller.id());
+        assert_eq!(listings.saved.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_seller_cannot_mark_sold() {
+        let mut seller = member("seller_two");
+        seller.verify();
+        let (listing, _) = Listing::list(
+            Id::generate(),
+            seller.id(),
+            seller.verified(),
+            listing_draft(),
+            Timestamp::now(),
+        )
+        .unwrap();
+        let listing_id = listing.id();
+        let uc = MarkListingSold::new(FakeListings::with(listing));
+        let err = uc
+            .execute(MarkListingSoldCommand {
+                listing: listing_id,
+                actor: Id::generate(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Marketplace(MarketplaceError::NotSeller)
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_admin_verifies() {
+        let actor = member("plain_user");
+        let target = member("wannabe");
+        let err = VerifyUser::new(FakeUsers::with(vec![actor.clone(), target.clone()]))
+            .execute(VerifyUserCommand {
+                actor: actor.id(),
+                target: target.handle().clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApplicationError::Forbidden(_)));
+
+        let admin = User::register(
+            Id::generate(),
+            Handle::parse("the_admin").unwrap(),
+            UserRole::Admin,
+            Timestamp::now(),
+        );
+        let verified = VerifyUser::new(FakeUsers::with(vec![admin.clone(), target.clone()]))
+            .execute(VerifyUserCommand {
+                actor: admin.id(),
+                target: target.handle().clone(),
+            })
+            .await
+            .unwrap();
+        assert!(verified.verified().is_verified());
     }
 }

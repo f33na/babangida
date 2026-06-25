@@ -5,6 +5,7 @@
 use babangida_domain::community::GroupId;
 use babangida_domain::content::PostId;
 use babangida_domain::identity::UserId;
+use babangida_domain::marketplace::ListingId;
 use babangida_domain::messaging::{ConversationId, MessageId};
 use babangida_shared::Timestamp;
 
@@ -237,6 +238,88 @@ impl<R: GroupReadModel> GroupQuery<R> {
             .by_slug(&query.slug)
             .await?
             .ok_or(ApplicationError::NotFound("group"))
+    }
+}
+
+// --- marketplace: общий раздел и товары продавца (ADR-0010/0014) ---
+
+/// Карточка товара под экран маркета/профиля.
+#[derive(Debug, Clone)]
+pub struct ListingView {
+    pub listing_id: ListingId,
+    pub seller: UserId,
+    pub seller_handle: String,
+    pub title: String,
+    pub price_rubles: u64,
+    pub description: Option<String>,
+    pub status: String,
+    pub created_at: Timestamp,
+}
+
+/// Read-модель товаров.
+#[async_trait::async_trait]
+pub trait ListingReadModel: Send + Sync {
+    /// Активные товары — общий раздел маркета.
+    async fn active(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ListingView>, babangida_domain::RepositoryError>;
+    /// Товары продавца по его handle — на профиль (анти-ВК).
+    async fn by_seller(
+        &self,
+        handle: &str,
+        limit: u32,
+    ) -> Result<Vec<ListingView>, babangida_domain::RepositoryError>;
+}
+
+/// Запрос общего раздела маркета (активные товары).
+pub struct MarketBrowse {
+    pub limit: u32,
+}
+
+/// Use-case чтения маркета.
+pub struct MarketQuery<R> {
+    listings: R,
+}
+
+impl<R: ListingReadModel> MarketQuery<R> {
+    pub fn new(listings: R) -> Self {
+        Self { listings }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое read-модели.
+    pub async fn execute(&self, query: MarketBrowse) -> Result<Vec<ListingView>, ApplicationError> {
+        self.listings.active(query.limit).await.map_err(Into::into)
+    }
+}
+
+/// Запрос товаров продавца по handle.
+pub struct SellerListings {
+    pub handle: String,
+    pub limit: u32,
+}
+
+/// Use-case чтения товаров продавца.
+pub struct SellerListingsQuery<R> {
+    listings: R,
+}
+
+impl<R: ListingReadModel> SellerListingsQuery<R> {
+    pub fn new(listings: R) -> Self {
+        Self { listings }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое read-модели.
+    pub async fn execute(
+        &self,
+        query: SellerListings,
+    ) -> Result<Vec<ListingView>, ApplicationError> {
+        self.listings
+            .by_seller(&query.handle, query.limit)
+            .await
+            .map_err(Into::into)
     }
 }
 

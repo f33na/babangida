@@ -30,6 +30,7 @@ use babangida_domain::community::{
 };
 use babangida_domain::content::PostBody;
 use babangida_domain::identity::{Handle, InviteCode, UserId, VerifiedStatus};
+use babangida_domain::marketplace::MarketplaceError;
 use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_infrastructure::{
@@ -120,7 +121,15 @@ fn app_error_response(err: ApplicationError) -> (StatusCode, String) {
         ApplicationError::Community(e) => (StatusCode::CONFLICT, e.to_string()),
         // Аутентификация: неверные данные или нет валидной сессии — 401.
         ApplicationError::Auth(e) => (StatusCode::UNAUTHORIZED, e.to_string()),
+        // Барахолка: гейт верификации и право продавца — запрещено; неактивный товар — конфликт.
+        ApplicationError::Marketplace(
+            e @ (MarketplaceError::NotVerified | MarketplaceError::NotSeller),
+        ) => (StatusCode::FORBIDDEN, e.to_string()),
+        ApplicationError::Marketplace(e @ MarketplaceError::NotActive) => {
+            (StatusCode::CONFLICT, e.to_string())
+        }
         ApplicationError::NotFound(what) => (StatusCode::NOT_FOUND, format!("не найдено: {what}")),
+        ApplicationError::Forbidden(what) => (StatusCode::FORBIDDEN, format!("запрещено: {what}")),
         ApplicationError::Repository(RepositoryError::NotFound) => {
             (StatusCode::NOT_FOUND, "не найдено".to_owned())
         }
