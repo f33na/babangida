@@ -10,7 +10,8 @@ use babangida_shared::Timestamp;
 
 use crate::ApplicationError;
 
-/// Элемент ленты под экран.
+/// Элемент ленты под экран. `group_*` заполнены, если пост опубликован в
+/// сообщество (анти-ВК: посты сообществ — в общей ленте, ADR-0012).
 #[derive(Debug, Clone)]
 pub struct FeedItemView {
     pub post_id: PostId,
@@ -18,6 +19,8 @@ pub struct FeedItemView {
     pub author_handle: String,
     pub body: String,
     pub created_at: Timestamp,
+    pub group_slug: Option<String>,
+    pub group_name: Option<String>,
 }
 
 /// Профиль под экран.
@@ -268,6 +271,8 @@ mod tests {
             author_handle: "rapper_one".to_owned(),
             body: "йоу".to_owned(),
             created_at: Timestamp::now(),
+            group_slug: None,
+            group_name: None,
         }
     }
 

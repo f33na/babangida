@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use babangida_shared::{Id, Timestamp};
 
 use crate::RepositoryError;
+use crate::content::Post;
 use crate::identity::UserId;
 
 /// Название сообщества. 1..=60 символов после обрезки, без управляющих символов.
@@ -415,6 +416,18 @@ impl Group {
         }
     }
 
+    /// Проверить право публикации в сообщество (командный путь поверх [`Group::can_post`]).
+    ///
+    /// # Errors
+    /// [`CommunityError::NotPermitted`], если у юзера нет права публиковать.
+    pub fn authorize_post(&self, user: UserId) -> Result<(), CommunityError> {
+        if self.can_post(user) {
+            Ok(())
+        } else {
+            Err(CommunityError::NotPermitted)
+        }
+    }
+
     /// Может ли наблюдатель читать сообщество: паблик — все, закрытая — участники.
     #[must_use]
     pub fn allows_read(&self, viewer: Option<UserId>) -> bool {
@@ -594,6 +607,14 @@ pub trait GroupRepository: Send + Sync {
     async fn save(&self, group: &Group) -> Result<(), RepositoryError>;
 }
 
+/// Публикация контента в сообщество (порт). Пост — обычный [`Post`] контекста
+/// `content` (его агрегат не меняется, ADR-0003); принадлежность сообществу —
+/// отдельная связь, поэтому пост и связь пишутся атомарно.
+#[async_trait]
+pub trait GroupPostRepository: Send + Sync {
+    async fn publish(&self, post: &Post, group: GroupId) -> Result<(), RepositoryError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +790,13 @@ mod tests {
         public.join(member, Timestamp::now()).unwrap();
         assert!(public.can_post(owner)); // модератор/владелец — да
         assert!(!public.can_post(member)); // рядовой участник паблика — нет
+
+        // authorize_post — командная обёртка над can_post.
+        assert!(public.authorize_post(owner).is_ok());
+        assert_eq!(
+            public.authorize_post(member).unwrap_err(),
+            CommunityError::NotPermitted
+        );
     }
 
     #[test]

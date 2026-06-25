@@ -3,8 +3,8 @@
 //! ([`Invite::issue`]/[`Invite::accept`]), а не хендлеры.
 
 use babangida_domain::community::{
-    Group, GroupId, GroupKind, GroupName, GroupRepository, GroupSlug, MemberJoined, MemberLeft,
-    MemberRoleChanged, MembershipRole,
+    Group, GroupId, GroupKind, GroupName, GroupPostRepository, GroupRepository, GroupSlug,
+    MemberJoined, MemberLeft, MemberRoleChanged, MembershipRole,
 };
 use babangida_domain::content::{Post, PostBody, PostRepository};
 use babangida_domain::identity::{
@@ -192,6 +192,47 @@ where
     pub async fn execute(&self, cmd: CreatePostCommand) -> Result<Post, ApplicationError> {
         let post = Post::create(Id::generate(), cmd.author, cmd.body, self.clock.now());
         self.posts.save(&post).await?;
+        Ok(post)
+    }
+}
+
+/// Опубликовать пост в сообщество.
+pub struct PostToGroupCommand {
+    pub author: UserId,
+    pub group: GroupId,
+    pub body: PostBody,
+}
+
+/// Use-case публикации в сообщество. Контент течёт в общую ленту (анти-ВК,
+/// ADR-0012); право публикации решает домен ([`Group::authorize_post`]): в закрытой
+/// — любой участник, в паблике — модераторы. Пост остаётся обычным `content::Post`
+/// (агрегат не меняется), связь с сообществом пишется атомарно в адаптере.
+pub struct PostToGroup<G, P, C> {
+    groups: G,
+    group_posts: P,
+    clock: C,
+}
+
+impl<G: GroupRepository, P: GroupPostRepository, C: Clock> PostToGroup<G, P, C> {
+    pub fn new(groups: G, group_posts: P, clock: C) -> Self {
+        Self {
+            groups,
+            group_posts,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: группы нет, нет права публикации, либо сбой хранилища.
+    pub async fn execute(&self, cmd: PostToGroupCommand) -> Result<Post, ApplicationError> {
+        let group = self
+            .groups
+            .find_by_id(cmd.group)
+            .await?
+            .ok_or(ApplicationError::NotFound("group"))?;
+        group.authorize_post(cmd.author)?;
+        let post = Post::create(Id::generate(), cmd.author, cmd.body, self.clock.now());
+        self.group_posts.publish(&post, cmd.group).await?;
         Ok(post)
     }
 }
@@ -406,6 +447,7 @@ mod tests {
     use async_trait::async_trait;
     use babangida_domain::RepositoryError;
     use babangida_domain::community::CommunityError;
+    use babangida_domain::content::PostId;
     use babangida_domain::identity::{InviteError, InviteQuota};
     use babangida_domain::messaging::{Message, MessagingError};
     use babangida_shared::{Duration, Timestamp};
@@ -730,6 +772,22 @@ mod tests {
                 saved: Mutex::new(None),
             }
         }
+        fn with(group: Group) -> Self {
+            Self {
+                saved: Mutex::new(Some(group)),
+            }
+        }
+    }
+
+    struct FakeGroupPosts {
+        published: Arc<Mutex<Vec<(PostId, GroupId)>>>,
+    }
+    #[async_trait]
+    impl GroupPostRepository for FakeGroupPosts {
+        async fn publish(&self, post: &Post, group: GroupId) -> Result<(), RepositoryError> {
+            self.published.lock().unwrap().push((post.id(), group));
+            Ok(())
+        }
     }
     #[async_trait]
     impl GroupRepository for FakeGroups {
@@ -875,5 +933,57 @@ mod tests {
             err,
             ApplicationError::Community(CommunityError::SoleOwner)
         ));
+    }
+
+    #[tokio::test]
+    async fn post_to_public_group_by_owner_publishes() {
+        let owner = Id::generate();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let uc = PostToGroup::new(
+            FakeGroups::with(public_group(owner)),
+            FakeGroupPosts {
+                published: published.clone(),
+            },
+            FixedClock(Timestamp::now()),
+        );
+        let post = uc
+            .execute(PostToGroupCommand {
+                author: owner,
+                group: Id::generate(),
+                body: PostBody::parse("трек из подвала").unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(post.author(), owner);
+        assert_eq!(published.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_to_public_group_by_member_is_rejected() {
+        let owner = Id::generate();
+        let mut group = public_group(owner);
+        let member = Id::generate();
+        group.join(member, Timestamp::now()).unwrap();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let uc = PostToGroup::new(
+            FakeGroups::with(group),
+            FakeGroupPosts {
+                published: published.clone(),
+            },
+            FixedClock(Timestamp::now()),
+        );
+        let err = uc
+            .execute(PostToGroupCommand {
+                author: member,
+                group: Id::generate(),
+                body: PostBody::parse("я").unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Community(CommunityError::NotPermitted)
+        ));
+        assert_eq!(published.lock().unwrap().len(), 0);
     }
 }

@@ -12,8 +12,9 @@ use axum::routing::{get, post};
 use babangida_application::ApplicationError;
 use babangida_application::command::{
     CreatePost, CreatePostCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand,
-    JoinGroup, JoinGroupCommand, LeaveGroup, LeaveGroupCommand, Register, RegisterCommand,
-    SendMessage, SendMessageCommand, SetMemberRole, SetMemberRoleCommand,
+    JoinGroup, JoinGroupCommand, LeaveGroup, LeaveGroupCommand, PostToGroup, PostToGroupCommand,
+    Register, RegisterCommand, SendMessage, SendMessageCommand, SetMemberRole,
+    SetMemberRoleCommand,
 };
 use babangida_application::query::{
     FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf, InboxQuery, ProfileByHandle,
@@ -28,10 +29,10 @@ use babangida_domain::identity::{Handle, InviteCode, UserId};
 use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_infrastructure::{
-    Db, PgConversationRepository, PgFeedReadModel, PgGroupMembershipTxFactory, PgGroupReadModel,
-    PgGroupRepository, PgInboxReadModel, PgIssueInviteTxFactory, PgMessageRepository,
-    PgPostRepository, PgProfileReadModel, PgRegistrationTxFactory, PgThreadReadModel,
-    RandomInviteCodeFactory, SystemClock,
+    Db, PgConversationRepository, PgFeedReadModel, PgGroupMembershipTxFactory,
+    PgGroupPostRepository, PgGroupReadModel, PgGroupRepository, PgInboxReadModel,
+    PgIssueInviteTxFactory, PgMessageRepository, PgPostRepository, PgProfileReadModel,
+    PgRegistrationTxFactory, PgThreadReadModel, RandomInviteCodeFactory, SystemClock,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -60,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/groups/{id}/join", post(join_group))
         .route("/groups/{id}/leave", post(leave_group))
         .route("/groups/{id}/role", post(set_role))
+        .route("/groups/{id}/posts", post(post_to_group))
         .with_state(state)
 }
 
@@ -262,6 +264,9 @@ struct FeedItemRes {
     author_handle: String,
     body: String,
     created_at: i64,
+    /// Слаг сообщества, если пост опубликован в него (анти-ВК); иначе `null`.
+    group_slug: Option<String>,
+    group_name: Option<String>,
 }
 
 async fn feed(
@@ -282,6 +287,8 @@ async fn feed(
             author_handle: i.author_handle,
             body: i.body,
             created_at: i.created_at.into_offset().unix_timestamp(),
+            group_slug: i.group_slug,
+            group_name: i.group_name,
         })
         .collect();
     Ok(Json(out))
@@ -536,5 +543,33 @@ async fn set_role(
         group_id: event.group.to_string(),
         user: event.user.to_string(),
         role: event.new_role.as_str().to_owned(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct GroupPostReq {
+    author: String,
+    body: String,
+}
+
+async fn post_to_group(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<GroupPostReq>,
+) -> Result<Json<PostRes>, ApiError> {
+    let cmd = PostToGroupCommand {
+        author: UserId::parse(&req.author).map_err(invalid)?,
+        group: GroupId::parse(&id).map_err(invalid)?,
+        body: PostBody::parse(&req.body).map_err(invalid)?,
+    };
+    let uc = PostToGroup::new(
+        PgGroupRepository::new(st.db.clone()),
+        PgGroupPostRepository::new(st.db.clone()),
+        SystemClock,
+    );
+    let post = uc.execute(cmd).await?;
+    Ok(Json(PostRes {
+        post_id: post.id().to_string(),
+        created_at: post.created_at().into_offset().unix_timestamp(),
     }))
 }

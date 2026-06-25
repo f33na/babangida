@@ -183,6 +183,42 @@ async fn messaging_and_community_end_to_end() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "не владелец не модерирует");
 
+    // --- публикация в сообщество (анти-ВК: контент паблика — в общей ленте) ---
+    // владелец паблика постит → пост виден в общей ленте с меткой сообщества
+    let (status, body) = post_json(
+        &app,
+        &format!("/groups/{group_id}/posts"),
+        json!({ "author": alpha, "body": "трек из подвала" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "публикация в паблик: {body}");
+
+    let (status, body) = get_json(&app, "/feed").await;
+    assert_eq!(status, StatusCode::OK);
+    let item = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["body"] == "трек из подвала")
+        .expect("пост паблика в общей ленте");
+    assert_eq!(
+        item["group_slug"], "podval",
+        "в ленте проставлена метка паблика"
+    );
+
+    // рядовой участник паблика постить не может → запрещено
+    let (status, _) = post_json(
+        &app,
+        &format!("/groups/{group_id}/posts"),
+        json!({ "author": beta, "body": "я тоже" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "в паблике пишут только модераторы"
+    );
+
     // единственный владелец не может выйти → конфликт
     let (status, _) = post_json(
         &app,

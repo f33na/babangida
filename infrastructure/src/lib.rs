@@ -12,7 +12,9 @@ mod messaging;
 mod pool;
 
 pub use clock::SystemClock;
-pub use community::{PgGroupMembershipTxFactory, PgGroupReadModel, PgGroupRepository};
+pub use community::{
+    PgGroupMembershipTxFactory, PgGroupPostRepository, PgGroupReadModel, PgGroupRepository,
+};
 pub use content::{PgFeedReadModel, PgPostRepository, PgProfileReadModel};
 pub use identity::{PgIssueInviteTxFactory, PgRegistrationTxFactory, PgUserRepository};
 pub use invite_code::RandomInviteCodeFactory;

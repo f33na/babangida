@@ -6,8 +6,10 @@ use babangida_application::query::{GroupReadModel, GroupView};
 use babangida_application::{GroupMembershipTx, GroupMembershipTxFactory};
 use babangida_domain::RepositoryError;
 use babangida_domain::community::{
-    Group, GroupId, GroupKind, GroupName, GroupRepository, GroupSlug, MembershipRole,
+    Group, GroupId, GroupKind, GroupName, GroupPostRepository, GroupRepository, GroupSlug,
+    MembershipRole,
 };
+use babangida_domain::content::Post;
 use babangida_domain::identity::UserId;
 use babangida_shared::{Id, Timestamp};
 use sqlx::{Postgres, Transaction};
@@ -252,6 +254,41 @@ impl GroupMembershipTx for PgGroupMembershipTx {
         if let Some(tx) = self.tx.take() {
             tx.commit().await.map_err(map_sqlx)?;
         }
+        Ok(())
+    }
+}
+
+/// Публикация поста в сообщество: пост (`content.Post`) и связь пост↔сообщество
+/// пишутся атомарно в одной транзакции. Агрегат `Post` не меняется (ADR-0003).
+pub struct PgGroupPostRepository {
+    db: Db,
+}
+
+impl PgGroupPostRepository {
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl GroupPostRepository for PgGroupPostRepository {
+    async fn publish(&self, post: &Post, group: GroupId) -> Result<(), RepositoryError> {
+        let mut tx = self.db.begin().await.map_err(map_sqlx)?;
+        sqlx::query("INSERT INTO posts (id, author_id, body, created_at) VALUES ($1, $2, $3, $4)")
+            .bind(post.id().as_uuid())
+            .bind(post.author().as_uuid())
+            .bind(post.body().as_str())
+            .bind(post.created_at().into_offset())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        sqlx::query("INSERT INTO group_posts (post_id, group_id) VALUES ($1, $2)")
+            .bind(post.id().as_uuid())
+            .bind(group.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
         Ok(())
     }
 }

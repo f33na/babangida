@@ -81,9 +81,24 @@ impl PgFeedReadModel {
 #[async_trait]
 impl FeedReadModel for PgFeedReadModel {
     async fn recent(&self, limit: u32) -> Result<Vec<FeedItemView>, RepositoryError> {
-        let rows: Vec<(Uuid, Uuid, String, String, OffsetDateTime)> = sqlx::query_as(
-            "SELECT p.id, p.author_id, u.handle, p.body, p.created_at \
-             FROM posts p JOIN users u ON u.id = p.author_id \
+        // Анти-ВК: посты сообществ — в общей ленте (ADR-0012). Личные посты (без
+        // связи) и посты пабликов видны всем; посты закрытых групп в анонимную
+        // ленту не попадают (только участникам — отдельный экран позже).
+        let rows: Vec<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            OffsetDateTime,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT p.id, p.author_id, u.handle, p.body, p.created_at, g.slug, g.name \
+             FROM posts p \
+             JOIN users u ON u.id = p.author_id \
+             LEFT JOIN group_posts gp ON gp.post_id = p.id \
+             LEFT JOIN groups g ON g.id = gp.group_id \
+             WHERE gp.post_id IS NULL OR g.kind = 'public' \
              ORDER BY p.created_at DESC, p.id DESC LIMIT $1",
         )
         .bind(i64::from(limit))
@@ -92,13 +107,17 @@ impl FeedReadModel for PgFeedReadModel {
         .map_err(map_sqlx)?;
         Ok(rows
             .into_iter()
-            .map(|(post_id, author, author_handle, body, ts)| FeedItemView {
-                post_id: Id::from_uuid(post_id),
-                author: Id::from_uuid(author),
-                author_handle,
-                body,
-                created_at: Timestamp::from_offset(ts),
-            })
+            .map(
+                |(post_id, author, author_handle, body, ts, group_slug, group_name)| FeedItemView {
+                    post_id: Id::from_uuid(post_id),
+                    author: Id::from_uuid(author),
+                    author_handle,
+                    body,
+                    created_at: Timestamp::from_offset(ts),
+                    group_slug,
+                    group_name,
+                },
+            )
             .collect())
     }
 }
