@@ -1,0 +1,14 @@
+# Ускорения сборки, портированные из ev/banking. babangida — на stable (ADR-0001/0009),
+# поэтому nightly-функции банка (codegen-backend = "cranelift", -Z threads, -Z
+# track-diagnostics) здесь НЕ применяются. Кэш компиляции (sccache) и выбор линкера
+# для devShell/CI заданы в flake.nix (RUSTC_WRAPPER), чтобы plain `cargo build` вне
+# Nix не падал из-за отсутствующего sccache на PATH.
+
+# Быстрый линкер mold на Linux (CI + Linux-разработка). Линковка крупного воркспейса —
+# заметная доля времени сборки; mold кратно её сокращает. На macOS строки ниже не
+# применяются (host-таргет — *-apple-darwin), сборка идёт системным линкером (ld-prime).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

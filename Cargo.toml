@@ -76,3 +76,12 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# Меньше target/ и быстрее линковка: режем debuginfo (зависимостям он не нужен
+# вовсе), оставляя line-tables для читаемых бэктрейсов в нашем коде. Портировано
+# из ev/banking — на этом воркспейсе срезает размер debug-артефактов в разы.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

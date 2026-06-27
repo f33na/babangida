@@ -58,9 +58,14 @@
         # тесты против локального postgres). CI и локально: `nix run .#ci`.
         ci = pkgs.writeShellApplication {
           name = "ci";
-          runtimeInputs = [ rustToolchain postgres pgStart ];
+          runtimeInputs = [ rustToolchain postgres pgStart pkgs.sccache pkgs.mold ];
           text = ''
             export DATABASE_URL="${databaseUrl}"
+            # Тот же кэш компиляции и линкер, что и в devShell (см. devShells.env).
+            # На чистом раннере sccache просто заполняет кэш; на тёплом — кратно
+            # ускоряет повторный прогон. CARGO_INCREMENTAL=0 обязателен для sccache.
+            export RUSTC_WRAPPER=sccache
+            export CARGO_INCREMENTAL=0
             pg-start
             cargo fmt --all -- --check
             cargo clippy --workspace --all-targets -- -D warnings
@@ -79,6 +84,10 @@
             pgStop
             pkgs.pkg-config
             pkgs.openssl
+            # Кэш компиляции между сборками/ветками (RUSTC_WRAPPER ниже) + быстрый
+            # линкер mold для Linux-таргета (.cargo/config.toml). Портировано из ev/banking.
+            pkgs.sccache
+            pkgs.mold
             # frontend (Leptos SSR, ADR-0006): сборка web через `cargo leptos`.
             pkgs.cargo-leptos
             pkgs.tailwindcss
@@ -87,6 +96,13 @@
             # (закреплён в Cargo.toml под версию из nixpkgs).
             pkgs.wasm-bindgen-cli
           ];
+
+          # Общий кэш компиляции (sccache) между сборками и ветками — основной выигрыш
+          # на повторных сборках. sccache несовместим с инкрементальной сборкой, поэтому
+          # CARGO_INCREMENTAL=0. Портировано из ev/banking.
+          env.RUSTC_WRAPPER = "sccache";
+          env.CARGO_INCREMENTAL = "0";
+          env.RUST_BACKTRACE = "1";
 
           shellHook = ''
             export DATABASE_URL="${databaseUrl}"
