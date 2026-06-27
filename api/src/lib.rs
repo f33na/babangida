@@ -13,18 +13,20 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use babangida_application::ApplicationError;
 use babangida_application::command::{
-    Authenticate, AuthenticateCommand, CreateListing, CreateListingCommand, CreatePost,
-    CreatePostCommand, EstablishCredential, EstablishCredentialCommand, FoundGroup,
-    FoundGroupCommand, IssueInvite, IssueInviteCommand, JoinGroup, JoinGroupCommand, LeaveGroup,
-    LeaveGroupCommand, LogIn, LogInCommand, LogOut, LogOutCommand, MarkListingSold,
-    MarkListingSoldCommand, PostToGroup, PostToGroupCommand, Register, RegisterCommand,
-    SendMessage, SendMessageCommand, SetMemberRole, SetMemberRoleCommand, VerifyUser,
-    VerifyUserCommand, WithdrawListing, WithdrawListingCommand,
+    ApproveVerification, ApproveVerificationCommand, Authenticate, AuthenticateCommand,
+    CreateListing, CreateListingCommand, CreatePost, CreatePostCommand, EstablishCredential,
+    EstablishCredentialCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand,
+    JoinGroup, JoinGroupCommand, LeaveGroup, LeaveGroupCommand, LogIn, LogInCommand, LogOut,
+    LogOutCommand, MarkListingSold, MarkListingSoldCommand, PostToGroup, PostToGroupCommand,
+    Register, RegisterCommand, RejectVerification, RejectVerificationCommand, RequestVerification,
+    RequestVerificationCommand, SendMessage, SendMessageCommand, SetMemberRole,
+    SetMemberRoleCommand, VerifyUser, VerifyUserCommand, WithdrawListing, WithdrawListingCommand,
 };
 use babangida_application::query::{
     FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf, InboxQuery, ListingView, MarketBrowse,
-    MarketQuery, ProfileByHandle, ProfileQuery, ProfileView, RecentFeed, SellerListings,
-    SellerListingsQuery, ThreadOf, ThreadQuery,
+    MarketQuery, MyVerificationOf, MyVerificationQuery, PendingVerifications,
+    PendingVerificationsQuery, ProfileByHandle, ProfileQuery, ProfileView, RecentFeed,
+    SellerListings, SellerListingsQuery, ThreadOf, ThreadQuery,
 };
 use babangida_domain::RepositoryError;
 use babangida_domain::auth::{AuthError, Password, SESSION_TTL, SessionToken};
@@ -32,18 +34,22 @@ use babangida_domain::community::{
     CommunityError, GroupId, GroupKind, GroupName, GroupSlug, MembershipRole,
 };
 use babangida_domain::content::PostBody;
-use babangida_domain::identity::{Handle, InviteCode, UserId, UserRepository, VerifiedStatus};
+use babangida_domain::identity::{
+    Handle, InviteCode, UserId, UserRepository, UserRole, VerifiedStatus,
+};
 use babangida_domain::marketplace::{
     ListingDescription, ListingDraft, ListingId, ListingTitle, MarketplaceError, Price,
 };
 use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
 use babangida_domain::social::{DisplayName, Subculture};
+use babangida_domain::verification::{DecisionReason, RequestNote, VerificationRequestId};
 use babangida_infrastructure::{
     Argon2PasswordHasher, Db, PgConversationRepository, PgCredentialRepository, PgFeedReadModel,
     PgGroupMembershipTxFactory, PgGroupPostRepository, PgGroupReadModel, PgGroupRepository,
     PgInboxReadModel, PgIssueInviteTxFactory, PgListingReadModel, PgListingRepository,
     PgMessageRepository, PgPostRepository, PgProfileReadModel, PgRegistrationTxFactory,
-    PgSessionRepository, PgThreadReadModel, PgUserRepository, RandomInviteCodeFactory,
+    PgSessionRepository, PgThreadReadModel, PgUserRepository, PgVerificationDecisionTxFactory,
+    PgVerificationReadModel, PgVerificationRequestRepository, RandomInviteCodeFactory,
     RandomSessionTokenFactory, SystemClock,
 };
 use serde::{Deserialize, Serialize};
@@ -84,8 +90,22 @@ pub fn router(state: AppState) -> Router {
         .route("/listings/{id}/withdraw", post(withdraw_listing))
         .route("/market", get(market))
         .route("/profiles/{handle}/listings", get(seller_listings))
-        // верификация (админ открывает привилегированные зоны, ADR-0010)
+        // верификация (ADR-0010/0016): заявка от юзера, очередь и решение — у админа;
+        // прямой грант остаётся как админ-override.
         .route("/users/{handle}/verify", post(verify_user))
+        .route(
+            "/verification/requests",
+            post(request_verification).get(verification_queue),
+        )
+        .route("/verification/me", get(my_verification))
+        .route(
+            "/verification/requests/{id}/approve",
+            post(approve_verification),
+        )
+        .route(
+            "/verification/requests/{id}/reject",
+            post(reject_verification),
+        )
         .with_state(state)
 }
 
@@ -176,8 +196,12 @@ fn app_error_response(err: ApplicationError) -> (StatusCode, String) {
         ApplicationError::Marketplace(e @ MarketplaceError::NotActive) => {
             (StatusCode::CONFLICT, e.to_string())
         }
+        // Верификация: повторное решение по заявке — конфликт состояния.
+        ApplicationError::Verification(e) => (StatusCode::CONFLICT, e.to_string()),
         ApplicationError::NotFound(what) => (StatusCode::NOT_FOUND, format!("не найдено: {what}")),
         ApplicationError::Forbidden(what) => (StatusCode::FORBIDDEN, format!("запрещено: {what}")),
+        // Конфликт состояния (уже верифицирован / заявка уже подана).
+        ApplicationError::Conflict(what) => (StatusCode::CONFLICT, format!("конфликт: {what}")),
         ApplicationError::Repository(RepositoryError::NotFound) => {
             (StatusCode::NOT_FOUND, "не найдено".to_owned())
         }
@@ -965,5 +989,197 @@ async fn verify_user(
     Ok(Json(json!({
         "handle": user.handle().as_str(),
         "verified": user.verified().is_verified(),
+    })))
+}
+
+// --- верификация: заявка → рассмотрение (ADR-0016) ---
+
+/// Гейт «только админ» для админ-чтений (очередь верификации). Пишущие решения
+/// (approve/reject) проверяют роль внутри use-case; чтение очереди — здесь.
+async fn require_admin(db: &Db, user: UserId) -> Result<(), ApiError> {
+    let actor = PgUserRepository::new(db.clone())
+        .find_by_id(user)
+        .await
+        .map_err(|e| ApiError::App(e.into()))?
+        .ok_or(ApiError::App(ApplicationError::NotFound("actor")))?;
+    if actor.role() != UserRole::Admin {
+        return Err(ApiError::App(ApplicationError::Forbidden("только админ")));
+    }
+    Ok(())
+}
+
+/// Распарсить опциональную записку/причину: пустую/пробельную трактуем как «нет».
+fn parse_note(raw: Option<String>) -> Result<Option<RequestNote>, ApiError> {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(RequestNote::parse)
+        .transpose()
+        .map_err(invalid)
+}
+
+fn parse_reason(raw: Option<String>) -> Result<Option<DecisionReason>, ApiError> {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(DecisionReason::parse)
+        .transpose()
+        .map_err(invalid)
+}
+
+#[derive(Deserialize)]
+struct RequestVerificationReq {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Serialize)]
+struct VerificationRequestRes {
+    request_id: String,
+    status: String,
+}
+
+async fn request_verification(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Json(req): Json<RequestVerificationReq>,
+) -> Result<Json<VerificationRequestRes>, ApiError> {
+    let note = parse_note(req.note)?;
+    let uc = RequestVerification::new(
+        PgUserRepository::new(st.db.clone()),
+        PgVerificationRequestRepository::new(st.db.clone()),
+        SystemClock,
+    );
+    let request = uc
+        .execute(RequestVerificationCommand {
+            requester: current.id,
+            note,
+        })
+        .await?;
+    Ok(Json(VerificationRequestRes {
+        request_id: request.id().to_string(),
+        status: request.status().as_str().to_owned(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct QueueParams {
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct QueueItemRes {
+    request_id: String,
+    requester_handle: String,
+    note: Option<String>,
+    created_at: i64,
+}
+
+async fn verification_queue(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Query(params): Query<QueueParams>,
+) -> Result<Json<Vec<QueueItemRes>>, ApiError> {
+    require_admin(&st.db, current.id).await?;
+    let uc = PendingVerificationsQuery::new(PgVerificationReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(PendingVerifications {
+            limit: params.limit.unwrap_or(100),
+        })
+        .await?;
+    Ok(Json(
+        items
+            .into_iter()
+            .map(|v| QueueItemRes {
+                request_id: v.request_id.to_string(),
+                requester_handle: v.requester_handle,
+                note: v.note,
+                created_at: v.created_at.into_offset().unix_timestamp(),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Serialize)]
+struct MyVerificationRes {
+    request_id: String,
+    status: String,
+    decision_reason: Option<String>,
+    created_at: i64,
+    decided_at: Option<i64>,
+}
+
+async fn my_verification(
+    State(st): State<AppState>,
+    current: CurrentUser,
+) -> Result<Json<Option<MyVerificationRes>>, ApiError> {
+    let uc = MyVerificationQuery::new(PgVerificationReadModel::new(st.db.clone()));
+    let view = uc
+        .execute(MyVerificationOf {
+            requester: current.id,
+        })
+        .await?;
+    Ok(Json(view.map(|v| MyVerificationRes {
+        request_id: v.request_id.to_string(),
+        status: v.status,
+        decision_reason: v.decision_reason,
+        created_at: v.created_at.into_offset().unix_timestamp(),
+        decided_at: v.decided_at.map(|t| t.into_offset().unix_timestamp()),
+    })))
+}
+
+#[derive(Deserialize)]
+struct DecisionReq {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn approve_verification(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+    Json(req): Json<DecisionReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request = VerificationRequestId::parse(&id).map_err(invalid)?;
+    let reason = parse_reason(req.reason)?;
+    let uc = ApproveVerification::new(
+        PgVerificationDecisionTxFactory::new(st.db.clone()),
+        SystemClock,
+    );
+    let event = uc
+        .execute(ApproveVerificationCommand {
+            actor: current.id,
+            request,
+            reason,
+        })
+        .await?;
+    Ok(Json(json!({
+        "request_id": event.request.to_string(),
+        "status": "approved",
+    })))
+}
+
+async fn reject_verification(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+    Json(req): Json<DecisionReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request = VerificationRequestId::parse(&id).map_err(invalid)?;
+    let reason = parse_reason(req.reason)?;
+    let uc = RejectVerification::new(
+        PgVerificationDecisionTxFactory::new(st.db.clone()),
+        SystemClock,
+    );
+    let event = uc
+        .execute(RejectVerificationCommand {
+            actor: current.id,
+            request,
+            reason,
+        })
+        .await?;
+    Ok(Json(json!({
+        "request_id": event.request.to_string(),
+        "status": "rejected",
     })))
 }

@@ -15,5 +15,5 @@ pub use error::ApplicationError;
 pub use ports::{
     Clock, GroupMembershipTx, GroupMembershipTxFactory, InviteCodeFactory, InviterIssuanceState,
     IssueInviteTx, IssueInviteTxFactory, PasswordHasher, RegistrationTx, RegistrationTxFactory,
-    SessionTokenFactory,
+    SessionTokenFactory, VerificationDecisionTx, VerificationDecisionTxFactory,
 };

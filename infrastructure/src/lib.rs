@@ -12,6 +12,7 @@ mod invite_code;
 mod marketplace;
 mod messaging;
 mod pool;
+mod verification;
 
 pub use auth::{
     Argon2PasswordHasher, PgCredentialRepository, PgSessionRepository, RandomSessionTokenFactory,
@@ -28,3 +29,6 @@ pub use messaging::{
     PgConversationRepository, PgInboxReadModel, PgMessageRepository, PgThreadReadModel,
 };
 pub use pool::{Db, connect, run_migrations};
+pub use verification::{
+    PgVerificationDecisionTxFactory, PgVerificationReadModel, PgVerificationRequestRepository,
+};

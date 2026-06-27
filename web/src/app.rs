@@ -67,6 +67,7 @@ pub fn App() -> impl IntoView {
                 <A href="/">"лента"</A>
                 <A href="/market">"маркет"</A>
                 <A href="/messages">"сообщения"</A>
+                <A href="/verification">"верификация"</A>
                 <A href="/join">"вступить"</A>
                 <button
                     type="button"
@@ -85,6 +86,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/g/:slug") view=GroupPage />
                     <Route path=path!("/messages") view=InboxPage />
                     <Route path=path!("/messages/:id") view=ThreadPage />
+                    <Route path=path!("/verification") view=VerificationPage />
                     <Route path=path!("/login") view=LoginPage />
                     <Route path=path!("/join") view=JoinPage />
                 </Routes>
@@ -151,6 +153,21 @@ pub struct GroupDto {
     name: String,
     kind: String,
     member_count: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MyVerificationDto {
+    status: String,
+    #[serde(default)]
+    decision_reason: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VerificationQueueItemDto {
+    request_id: String,
+    requester_handle: String,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[cfg(feature = "ssr")]
@@ -547,6 +564,128 @@ async fn send_message(recipient_handle: String, body: String) -> Result<(), Serv
     }
 }
 
+// --- верификация (ADR-0010/0016: гейт привилегий; заявка → рассмотрение админом) ---
+
+/// Статус моей последней заявки (Bearer). Гость / нет заявки → `None`.
+#[server]
+async fn fetch_my_verification() -> Result<Option<MyVerificationDto>, ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Ok(None);
+    };
+    let resp = reqwest::Client::new()
+        .get(format!("{}/verification/me", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    resp.json::<Option<MyVerificationDto>>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Подать заявку на верификацию (Bearer). Пустая записка → без записки.
+#[server]
+async fn request_verification(note: String) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let body = if note.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "note": note })
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/verification/requests", api_base()))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        409 => Err(ServerFnError::new(
+            "заявка уже подана или ты уже verified".to_string(),
+        )),
+        _ => Err(ServerFnError::new("не удалось подать заявку".to_string())),
+    }
+}
+
+/// Очередь заявок на рассмотрении (Bearer; только админ). Не-админ/гость → пусто.
+#[server]
+async fn fetch_verification_queue() -> Result<Vec<VerificationQueueItemDto>, ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Ok(Vec::new());
+    };
+    let resp = reqwest::Client::new()
+        .get(format!("{}/verification/requests", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    resp.json::<Vec<VerificationQueueItemDto>>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Одобрить заявку (Bearer; только админ).
+#[server]
+async fn approve_verification(request_id: String) -> Result<(), ServerFnError> {
+    verification_decision(&request_id, "approve", String::new()).await
+}
+
+/// Отклонить заявку с причиной (Bearer; только админ).
+#[server]
+async fn reject_verification(request_id: String, reason: String) -> Result<(), ServerFnError> {
+    verification_decision(&request_id, "reject", reason).await
+}
+
+/// Общий POST решения по заявке: `approve` | `reject`. Пустая причина → без причины.
+#[cfg(feature = "ssr")]
+async fn verification_decision(
+    request_id: &str,
+    action: &str,
+    reason: String,
+) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let body = if reason.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "reason": reason })
+    };
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/verification/requests/{request_id}/{action}",
+            api_base()
+        ))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        403 => Err(ServerFnError::new("решать может только админ".to_string())),
+        409 => Err(ServerFnError::new("заявка уже рассмотрена".to_string())),
+        _ => Err(ServerFnError::new(
+            "не удалось применить решение".to_string(),
+        )),
+    }
+}
+
 // --- нав: текущий юзер ---
 
 #[component]
@@ -764,6 +903,173 @@ fn MarketPage() -> impl IntoView {
 }
 
 #[component]
+fn VerificationPage() -> impl IntoView {
+    let request = ServerAction::<RequestVerification>::new();
+    let approve = ServerAction::<ApproveVerification>::new();
+    let reject = ServerAction::<RejectVerification>::new();
+    let req_val = request.value();
+    let me = Resource::new(|| (), |()| fetch_me());
+    // Свой статус перечитывается после подачи заявки.
+    let myver = Resource::new(move || request.version().get(), |_| fetch_my_verification());
+    // Очередь перечитывается после любого решения.
+    let queue = Resource::new(
+        move || (approve.version().get(), reject.version().get()),
+        |_| fetch_verification_queue(),
+    );
+    view! {
+        <div class="p-4 flex flex-col gap-4">
+            <h1 class="text-lg font-bold text-[var(--text)]">"верификация"</h1>
+            <p class="text-sm text-[var(--text-muted)]">
+                "верификация открывает маркет и загрузку музыки. подай заявку — её рассмотрит админ."
+            </p>
+            // --- моя заявка / статус ---
+            <Suspense fallback=move || {
+                view! { <p class="text-[var(--text-muted)]">"загрузка…"</p> }
+            }>
+                {move || Suspend::new(async move {
+                    let Some(me) = me.await.ok().flatten() else {
+                        return view! {
+                            <p class="text-[var(--text-muted)]">
+                                <A href="/login">"войди"</A>
+                                ", чтобы пройти верификацию"
+                            </p>
+                        }
+                            .into_any();
+                    };
+                    if me.verified {
+                        return view! {
+                            <Card>
+                                <div class="flex items-center gap-2">
+                                    "ты " <Badge accent=true>"verified"</Badge>
+                                    " — маркет и музыка открыты"
+                                </div>
+                            </Card>
+                        }
+                            .into_any();
+                    }
+                    let status = myver.await.ok().flatten();
+                    let form = move || {
+                        view! {
+                            <ActionForm action=request attr:class="flex flex-col gap-3">
+                                <TextArea
+                                    name="note"
+                                    label="пара слов о себе (необязательно)"
+                                    placeholder="ссылки на треки, кто ты, чем занят"
+                                />
+                                <Button submit=true variant=ButtonVariant::Primary>
+                                    "подать заявку"
+                                </Button>
+                            </ActionForm>
+                            {move || match req_val.get() {
+                                Some(Err(e)) => {
+                                    view! {
+                                        <p class="mt-2 text-[var(--danger)] text-sm">{e.to_string()}</p>
+                                    }
+                                        .into_any()
+                                }
+                                _ => ().into_any(),
+                            }}
+                        }
+                    };
+                    match status.as_ref().map(|s| s.status.as_str()) {
+                        Some("pending") => {
+                            view! {
+                                <Card>
+                                    <p class="text-[var(--text-muted)]">"заявка на рассмотрении"</p>
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        Some("rejected") => {
+                            let reason = status.and_then(|s| s.decision_reason);
+                            view! {
+                                <Card>
+                                    <p class="text-[var(--text)]">"заявка отклонена"</p>
+                                    {reason
+                                        .map(|r| {
+                                            view! {
+                                                <p class="mt-1 mb-3 text-sm text-[var(--text-muted)]">{r}</p>
+                                            }
+                                        })}
+                                    {form()}
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        _ => view! { <Card>{form()}</Card> }.into_any(),
+                    }
+                })}
+            </Suspense>
+            // --- очередь админа (пусто для не-админов — секция скрыта) ---
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    match queue.await {
+                        Ok(items) if !items.is_empty() => {
+                            view! {
+                                <div class="flex flex-col gap-3">
+                                    <h2 class="font-bold text-[var(--text)]">"заявки на рассмотрении"</h2>
+                                    {items
+                                        .into_iter()
+                                        .map(|q| {
+                                            let id_a = q.request_id.clone();
+                                            let id_r = q.request_id.clone();
+                                            view! {
+                                                <Card>
+                                                    <div class="font-semibold text-[var(--text)]">
+                                                        "@"{q.requester_handle}
+                                                    </div>
+                                                    {q
+                                                        .note
+                                                        .map(|n| {
+                                                            view! {
+                                                                <p class="mt-1 text-sm text-[var(--text-muted)]">{n}</p>
+                                                            }
+                                                        })}
+                                                    <div class="flex items-center gap-3 mt-3">
+                                                        <ActionForm action=approve attr:class="inline">
+                                                            <input type="hidden" name="request_id" value=id_a />
+                                                            <button
+                                                                type="submit"
+                                                                class="text-sm font-semibold text-[var(--accent)] hover:underline"
+                                                            >
+                                                                "одобрить"
+                                                            </button>
+                                                        </ActionForm>
+                                                        <ActionForm
+                                                            action=reject
+                                                            attr:class="flex items-center gap-2"
+                                                        >
+                                                            <input type="hidden" name="request_id" value=id_r />
+                                                            <input
+                                                                name="reason"
+                                                                placeholder="причина (необязательно)"
+                                                                class="px-2 py-1 text-sm bg-[var(--surface-raised)] border border-[var(--border)] rounded-[var(--radius)] text-[var(--text)]"
+                                                            />
+                                                            <button
+                                                                type="submit"
+                                                                class="text-sm text-[var(--text-muted)] hover:text-[var(--text)]"
+                                                            >
+                                                                "отклонить"
+                                                            </button>
+                                                        </ActionForm>
+                                                    </div>
+                                                </Card>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        _ => ().into_any(),
+                    }
+                })}
+            </Suspense>
+        </div>
+    }
+}
+
+#[component]
 fn ProfilePage() -> impl IntoView {
     let params = use_params_map();
     let handle = move || params.read().get("handle").unwrap_or_default();
@@ -816,6 +1122,28 @@ fn ProfilePage() -> impl IntoView {
                             view! { <p class="text-[var(--danger)]">"профиль не найден"</p> }
                                 .into_any()
                         }
+                    }
+                })}
+            </Suspense>
+            // Свой профиль и ещё не verified — приглашение пройти верификацию (анти-ВК:
+            // действие живёт в профиле, форма — на /verification).
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    let my_handle = me.await.ok().flatten().map(|m| m.handle);
+                    match (my_handle, profile.await.ok()) {
+                        (Some(mh), Some(p)) if mh == p.handle && !p.verified => {
+                            view! {
+                                <Card>
+                                    <p class="text-sm text-[var(--text-muted)]">
+                                        "ты ещё не verified — "
+                                        <A href="/verification">"подай заявку"</A>
+                                        ", чтобы продавать и грузить музыку"
+                                    </p>
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        _ => ().into_any(),
                     }
                 })}
             </Suspense>

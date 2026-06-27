@@ -324,7 +324,10 @@ async fn messaging_and_community_end_to_end() {
         .iter()
         .find(|i| i["body"] == "секрет из бункера")
         .expect("участник видит пост своей закрытой группы");
-    assert_eq!(item["group_slug"], "bunker", "метка закрытой группы в ленте");
+    assert_eq!(
+        item["group_slug"], "bunker",
+        "метка закрытой группы в ленте"
+    );
 
     // единственный владелец (alpha) не может выйти → конфликт
     let (status, _) = request(

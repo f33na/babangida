@@ -7,6 +7,7 @@ use babangida_domain::auth::{Credential, Password, PasswordHash, SessionToken};
 use babangida_domain::community::{Group, GroupId};
 use babangida_domain::identity::{Invite, InviteCode, InviteQuota, User, UserId};
 use babangida_domain::social::Profile;
+use babangida_domain::verification::{VerificationRequest, VerificationRequestId};
 use babangida_shared::Timestamp;
 
 /// Источник текущего времени (адаптер часов).
@@ -127,4 +128,32 @@ pub trait GroupMembershipTx: Send {
 #[async_trait]
 pub trait GroupMembershipTxFactory: Send + Sync {
     async fn begin(&self) -> Result<Box<dyn GroupMembershipTx>, RepositoryError>;
+}
+
+/// Транзакция решения по заявке на верификацию (ADR-0016, по образцу ADR-0011/0012).
+/// Блокирует строку заявки (`SELECT ... FOR UPDATE`) — чтобы параллельные
+/// одобрение и отказ не разъехались (иначе заявка может стать `Rejected`, а юзер —
+/// уже `Verified`). При одобрении статус юзера ([`User::verify`]) пишется в той же
+/// транзакции, что и переход заявки в `Approved`, — атомарно.
+#[async_trait]
+pub trait VerificationDecisionTx: Send {
+    /// Прочитать юзера (актор для проверки прав админа либо заявитель для верификации).
+    async fn find_user(&mut self, id: UserId) -> Result<Option<User>, RepositoryError>;
+    /// Заблокировать заявку и вернуть её агрегат. `None` — заявки нет.
+    async fn lock_request(
+        &mut self,
+        id: VerificationRequestId,
+    ) -> Result<Option<VerificationRequest>, RepositoryError>;
+    /// Сохранить изменённую заявку (новый статус/решение) в рамках транзакции.
+    async fn save_request(&mut self, request: &VerificationRequest) -> Result<(), RepositoryError>;
+    /// Сохранить изменённого юзера (верифицированный статус) — только при одобрении.
+    async fn save_user(&mut self, user: &User) -> Result<(), RepositoryError>;
+    /// Зафиксировать транзакцию.
+    async fn commit(&mut self) -> Result<(), RepositoryError>;
+}
+
+/// Фабрика транзакций решений по верификации.
+#[async_trait]
+pub trait VerificationDecisionTxFactory: Send + Sync {
+    async fn begin(&self) -> Result<Box<dyn VerificationDecisionTx>, RepositoryError>;
 }

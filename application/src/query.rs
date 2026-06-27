@@ -7,6 +7,7 @@ use babangida_domain::content::PostId;
 use babangida_domain::identity::UserId;
 use babangida_domain::marketplace::ListingId;
 use babangida_domain::messaging::{ConversationId, MessageId};
+use babangida_domain::verification::VerificationRequestId;
 use babangida_shared::Timestamp;
 
 use crate::ApplicationError;
@@ -325,6 +326,95 @@ impl<R: ListingReadModel> SellerListingsQuery<R> {
     ) -> Result<Vec<ListingView>, ApplicationError> {
         self.listings
             .by_seller(&query.handle, query.limit)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+// --- verification: очередь админа и статус заявки (ADR-0016) ---
+
+/// Заявка в очереди админа (ожидает рассмотрения).
+#[derive(Debug, Clone)]
+pub struct VerificationRequestView {
+    pub request_id: VerificationRequestId,
+    pub requester_handle: String,
+    pub note: Option<String>,
+    pub created_at: Timestamp,
+}
+
+/// Состояние заявки юзера под экран/бейдж (последняя по времени).
+#[derive(Debug, Clone)]
+pub struct MyVerificationView {
+    pub request_id: VerificationRequestId,
+    pub status: String,
+    pub decision_reason: Option<String>,
+    pub created_at: Timestamp,
+    pub decided_at: Option<Timestamp>,
+}
+
+/// Read-модель заявок на верификацию.
+#[async_trait::async_trait]
+pub trait VerificationReadModel: Send + Sync {
+    /// Очередь ожидающих рассмотрения (старые сверху) — экран админа.
+    async fn pending(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<VerificationRequestView>, babangida_domain::RepositoryError>;
+    /// Последняя заявка юзера, если есть — для статуса/бейджа в его UI.
+    async fn latest_for(
+        &self,
+        requester: UserId,
+    ) -> Result<Option<MyVerificationView>, babangida_domain::RepositoryError>;
+}
+
+/// Запрос очереди заявок (ожидающих).
+pub struct PendingVerifications {
+    pub limit: u32,
+}
+
+/// Use-case чтения очереди верификации (только админ — проверка прав на границе `api`).
+pub struct PendingVerificationsQuery<R> {
+    requests: R,
+}
+
+impl<R: VerificationReadModel> PendingVerificationsQuery<R> {
+    pub fn new(requests: R) -> Self {
+        Self { requests }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое read-модели.
+    pub async fn execute(
+        &self,
+        query: PendingVerifications,
+    ) -> Result<Vec<VerificationRequestView>, ApplicationError> {
+        self.requests.pending(query.limit).await.map_err(Into::into)
+    }
+}
+
+/// Запрос статуса своей заявки.
+pub struct MyVerificationOf {
+    pub requester: UserId,
+}
+
+/// Use-case чтения статуса заявки текущего юзера.
+pub struct MyVerificationQuery<R> {
+    requests: R,
+}
+
+impl<R: VerificationReadModel> MyVerificationQuery<R> {
+    pub fn new(requests: R) -> Self {
+        Self { requests }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое read-модели. `None` — заявок не было.
+    pub async fn execute(
+        &self,
+        query: MyVerificationOf,
+    ) -> Result<Option<MyVerificationView>, ApplicationError> {
+        self.requests
+            .latest_for(query.requester)
             .await
             .map_err(Into::into)
     }

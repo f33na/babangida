@@ -37,7 +37,7 @@ fn parse_role(raw: &str) -> Result<UserRole, RepositoryError> {
     }
 }
 
-fn row_to_user(
+pub(crate) fn row_to_user(
     id: Uuid,
     handle: String,
     role: String,

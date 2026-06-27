@@ -23,11 +23,15 @@ use babangida_domain::messaging::{
     MessageRepository, MessageSent,
 };
 use babangida_domain::social::{DisplayName, Profile, Subculture};
+use babangida_domain::verification::{
+    DecisionReason, RequestNote, VerificationApproved, VerificationRejected, VerificationRequest,
+    VerificationRequestId, VerificationRequestRepository,
+};
 use babangida_shared::{Id, Timestamp};
 
 use crate::{
     ApplicationError, Clock, GroupMembershipTxFactory, InviteCodeFactory, IssueInviteTxFactory,
-    PasswordHasher, RegistrationTxFactory, SessionTokenFactory,
+    PasswordHasher, RegistrationTxFactory, SessionTokenFactory, VerificationDecisionTxFactory,
 };
 
 /// Выдать инвайт от имени юзера.
@@ -823,6 +827,173 @@ impl<U: UserRepository> VerifyUser<U> {
     }
 }
 
+/// Подать заявку на верификацию (ADR-0016). Гейт открывают админы рассмотрением;
+/// прямой грант [`VerifyUser`] остаётся за админом, а это — путь самого юзера.
+pub struct RequestVerificationCommand {
+    pub requester: UserId,
+    pub note: Option<RequestNote>,
+}
+
+/// Use-case подачи заявки. Кросс-агрегатные правила здесь (домен их не видит):
+/// уже верифицированному незачем (`Conflict`), вторую открытую заявку нельзя
+/// (`Conflict`) — гонку добивает партиал-уникальный индекс в БД (ADR-0016).
+pub struct RequestVerification<U, R, C> {
+    users: U,
+    requests: R,
+    clock: C,
+}
+
+impl<U, R, C> RequestVerification<U, R, C>
+where
+    U: UserRepository,
+    R: VerificationRequestRepository,
+    C: Clock,
+{
+    pub fn new(users: U, requests: R, clock: C) -> Self {
+        Self {
+            users,
+            requests,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: юзера нет, уже верифицирован/уже есть открытая заявка
+    /// (`Conflict`), либо сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: RequestVerificationCommand,
+    ) -> Result<VerificationRequest, ApplicationError> {
+        let user = self
+            .users
+            .find_by_id(cmd.requester)
+            .await?
+            .ok_or(ApplicationError::NotFound("user"))?;
+        if user.verified().is_verified() {
+            return Err(ApplicationError::Conflict("юзер уже верифицирован"));
+        }
+        if self
+            .requests
+            .find_pending_by_requester(cmd.requester)
+            .await?
+            .is_some()
+        {
+            return Err(ApplicationError::Conflict("заявка уже на рассмотрении"));
+        }
+        let (request, _event) = VerificationRequest::open(
+            VerificationRequestId::generate(),
+            cmd.requester,
+            cmd.note,
+            self.clock.now(),
+        );
+        self.requests.save(&request).await?;
+        Ok(request)
+    }
+}
+
+/// Одобрить заявку на верификацию (только админ).
+pub struct ApproveVerificationCommand {
+    pub actor: UserId,
+    pub request: VerificationRequestId,
+    pub reason: Option<DecisionReason>,
+}
+
+/// Use-case одобрения. Атомарен (ADR-0016): заявка блокируется, переходит в
+/// `Approved`, и заявитель помечается верифицированным ([`User::verify`]) — всё в
+/// одной транзакции, иначе возможно полу-состояние (заявка одобрена, юзер нет).
+/// Право решать — только у админа; машину состояний держит домен.
+pub struct ApproveVerification<T, C> {
+    tx_factory: T,
+    clock: C,
+}
+
+impl<T: VerificationDecisionTxFactory, C: Clock> ApproveVerification<T, C> {
+    pub fn new(tx_factory: T, clock: C) -> Self {
+        Self { tx_factory, clock }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: актор не админ (`Forbidden`), заявки/юзера нет, заявка
+    /// уже рассмотрена (`Verification`), либо сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: ApproveVerificationCommand,
+    ) -> Result<VerificationApproved, ApplicationError> {
+        let mut tx = self.tx_factory.begin().await?;
+        let actor = tx
+            .find_user(cmd.actor)
+            .await?
+            .ok_or(ApplicationError::NotFound("actor"))?;
+        if actor.role() != UserRole::Admin {
+            return Err(ApplicationError::Forbidden(
+                "рассматривать заявки может только админ",
+            ));
+        }
+        let mut request = tx
+            .lock_request(cmd.request)
+            .await?
+            .ok_or(ApplicationError::NotFound("verification request"))?;
+        let event = request.approve(cmd.actor, cmd.reason, self.clock.now())?;
+        let mut requester = tx
+            .find_user(request.requester())
+            .await?
+            .ok_or(ApplicationError::NotFound("user"))?;
+        requester.verify();
+        tx.save_request(&request).await?;
+        tx.save_user(&requester).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+}
+
+/// Отклонить заявку на верификацию (только админ).
+pub struct RejectVerificationCommand {
+    pub actor: UserId,
+    pub request: VerificationRequestId,
+    pub reason: Option<DecisionReason>,
+}
+
+/// Use-case отказа. Через ту же блокирующую транзакцию, что и одобрение (ADR-0016):
+/// решения по заявке сериализуются на её строке, поэтому параллельные одобрение и
+/// отказ не разъедутся. Меняется только заявка — юзер не трогается.
+pub struct RejectVerification<T, C> {
+    tx_factory: T,
+    clock: C,
+}
+
+impl<T: VerificationDecisionTxFactory, C: Clock> RejectVerification<T, C> {
+    pub fn new(tx_factory: T, clock: C) -> Self {
+        Self { tx_factory, clock }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: актор не админ (`Forbidden`), заявки нет, заявка уже
+    /// рассмотрена (`Verification`), либо сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: RejectVerificationCommand,
+    ) -> Result<VerificationRejected, ApplicationError> {
+        let mut tx = self.tx_factory.begin().await?;
+        let actor = tx
+            .find_user(cmd.actor)
+            .await?
+            .ok_or(ApplicationError::NotFound("actor"))?;
+        if actor.role() != UserRole::Admin {
+            return Err(ApplicationError::Forbidden(
+                "рассматривать заявки может только админ",
+            ));
+        }
+        let mut request = tx
+            .lock_request(cmd.request)
+            .await?
+            .ok_or(ApplicationError::NotFound("verification request"))?;
+        let event = request.reject(cmd.actor, cmd.reason, self.clock.now())?;
+        tx.save_request(&request).await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -836,10 +1007,14 @@ mod tests {
     use babangida_domain::identity::{InviteError, InviteQuota};
     use babangida_domain::marketplace::{ListingTitle, MarketplaceError, Price};
     use babangida_domain::messaging::{Message, MessagingError};
+    use babangida_domain::verification::{RequestStatus, VerificationError};
     use babangida_shared::{Duration, Timestamp};
 
     use super::*;
-    use crate::{GroupMembershipTx, GroupMembershipTxFactory, InviterIssuanceState, IssueInviteTx};
+    use crate::{
+        GroupMembershipTx, GroupMembershipTxFactory, InviterIssuanceState, IssueInviteTx,
+        VerificationDecisionTx, VerificationDecisionTxFactory,
+    };
 
     struct FixedClock(Timestamp);
     impl Clock for FixedClock {
@@ -1801,5 +1976,307 @@ mod tests {
             .await
             .unwrap();
         assert!(verified.verified().is_verified());
+    }
+
+    // --- verification: заявка → рассмотрение (ADR-0016) ---
+
+    fn admin(handle: &str) -> User {
+        User::register(
+            Id::generate(),
+            Handle::parse(handle).unwrap(),
+            UserRole::Admin,
+            Timestamp::now(),
+        )
+    }
+
+    /// Общий стор юзеров и заявок для фейков verification — тест видит итоговое
+    /// состояние (статус заявки, верифицирован ли юзер, был ли commit).
+    #[derive(Clone)]
+    struct FakeVerStore {
+        users: Arc<Mutex<Vec<User>>>,
+        requests: Arc<Mutex<Vec<VerificationRequest>>>,
+        committed: Arc<AtomicBool>,
+    }
+    impl FakeVerStore {
+        fn new(users: Vec<User>, requests: Vec<VerificationRequest>) -> Self {
+            Self {
+                users: Arc::new(Mutex::new(users)),
+                requests: Arc::new(Mutex::new(requests)),
+                committed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+        fn request(&self, id: VerificationRequestId) -> VerificationRequest {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id() == id)
+                .cloned()
+                .unwrap()
+        }
+        fn user(&self, id: UserId) -> User {
+            self.users
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|u| u.id() == id)
+                .cloned()
+                .unwrap()
+        }
+    }
+    #[async_trait]
+    impl VerificationRequestRepository for FakeVerStore {
+        async fn find_by_id(
+            &self,
+            id: VerificationRequestId,
+        ) -> Result<Option<VerificationRequest>, RepositoryError> {
+            Ok(self
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id() == id)
+                .cloned())
+        }
+        async fn find_pending_by_requester(
+            &self,
+            requester: UserId,
+        ) -> Result<Option<VerificationRequest>, RepositoryError> {
+            Ok(self
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.requester() == requester && r.status().is_pending())
+                .cloned())
+        }
+        async fn save(&self, request: &VerificationRequest) -> Result<(), RepositoryError> {
+            let mut reqs = self.requests.lock().unwrap();
+            if let Some(slot) = reqs.iter_mut().find(|r| r.id() == request.id()) {
+                *slot = request.clone();
+            } else {
+                reqs.push(request.clone());
+            }
+            Ok(())
+        }
+    }
+
+    struct FakeDecisionTx(FakeVerStore);
+    #[async_trait]
+    impl VerificationDecisionTx for FakeDecisionTx {
+        async fn find_user(&mut self, id: UserId) -> Result<Option<User>, RepositoryError> {
+            Ok(self
+                .0
+                .users
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|u| u.id() == id)
+                .cloned())
+        }
+        async fn lock_request(
+            &mut self,
+            id: VerificationRequestId,
+        ) -> Result<Option<VerificationRequest>, RepositoryError> {
+            Ok(self
+                .0
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id() == id)
+                .cloned())
+        }
+        async fn save_request(
+            &mut self,
+            request: &VerificationRequest,
+        ) -> Result<(), RepositoryError> {
+            let mut reqs = self.0.requests.lock().unwrap();
+            if let Some(slot) = reqs.iter_mut().find(|r| r.id() == request.id()) {
+                *slot = request.clone();
+            }
+            Ok(())
+        }
+        async fn save_user(&mut self, user: &User) -> Result<(), RepositoryError> {
+            let mut users = self.0.users.lock().unwrap();
+            if let Some(slot) = users.iter_mut().find(|u| u.id() == user.id()) {
+                *slot = user.clone();
+            }
+            Ok(())
+        }
+        async fn commit(&mut self) -> Result<(), RepositoryError> {
+            self.0.committed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct FakeDecisionFactory(FakeVerStore);
+    #[async_trait]
+    impl VerificationDecisionTxFactory for FakeDecisionFactory {
+        async fn begin(&self) -> Result<Box<dyn VerificationDecisionTx>, RepositoryError> {
+            Ok(Box::new(FakeDecisionTx(self.0.clone())))
+        }
+    }
+
+    fn pending_for(requester: UserId) -> VerificationRequest {
+        VerificationRequest::open(
+            VerificationRequestId::generate(),
+            requester,
+            None,
+            Timestamp::now(),
+        )
+        .0
+    }
+
+    #[tokio::test]
+    async fn request_opens_pending() {
+        let user = member("rapper");
+        let store = FakeVerStore::new(vec![], vec![]);
+        let req = RequestVerification::new(
+            FakeUsers::with(vec![user.clone()]),
+            store.clone(),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(RequestVerificationCommand {
+            requester: user.id(),
+            note: Some(RequestNote::parse("залил три релиза").unwrap()),
+        })
+        .await
+        .unwrap();
+        assert!(req.status().is_pending());
+        assert_eq!(store.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn already_verified_cannot_request() {
+        let mut user = member("verified_guy");
+        user.verify();
+        let store = FakeVerStore::new(vec![], vec![]);
+        let err = RequestVerification::new(
+            FakeUsers::with(vec![user.clone()]),
+            store.clone(),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(RequestVerificationCommand {
+            requester: user.id(),
+            note: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApplicationError::Conflict(_)));
+        assert!(store.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_pending_request_rejected() {
+        let user = member("eager");
+        let store = FakeVerStore::new(vec![], vec![pending_for(user.id())]);
+        let err = RequestVerification::new(
+            FakeUsers::with(vec![user.clone()]),
+            store.clone(),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(RequestVerificationCommand {
+            requester: user.id(),
+            note: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApplicationError::Conflict(_)));
+        assert_eq!(store.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approve_verifies_user_atomically() {
+        let boss = admin("boss");
+        let requester = member("hopeful");
+        let req = pending_for(requester.id());
+        let req_id = req.id();
+        let store = FakeVerStore::new(vec![boss.clone(), requester.clone()], vec![req]);
+        let event = ApproveVerification::new(
+            FakeDecisionFactory(store.clone()),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(ApproveVerificationCommand {
+            actor: boss.id(),
+            request: req_id,
+            reason: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(event.requester, requester.id());
+        assert_eq!(store.request(req_id).status(), RequestStatus::Approved);
+        assert!(store.user(requester.id()).verified().is_verified());
+        assert!(store.committed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_approve() {
+        let plain = member("nobody");
+        let requester = member("hopeful2");
+        let req = pending_for(requester.id());
+        let req_id = req.id();
+        let store = FakeVerStore::new(vec![plain.clone(), requester.clone()], vec![req]);
+        let err = ApproveVerification::new(
+            FakeDecisionFactory(store.clone()),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(ApproveVerificationCommand {
+            actor: plain.id(),
+            request: req_id,
+            reason: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApplicationError::Forbidden(_)));
+        assert_eq!(store.request(req_id).status(), RequestStatus::Pending);
+        assert!(!store.user(requester.id()).verified().is_verified());
+        assert!(!store.committed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reject_marks_rejected_without_verifying() {
+        let boss = admin("boss2");
+        let requester = member("hopeful3");
+        let req = pending_for(requester.id());
+        let req_id = req.id();
+        let store = FakeVerStore::new(vec![boss.clone(), requester.clone()], vec![req]);
+        RejectVerification::new(
+            FakeDecisionFactory(store.clone()),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(RejectVerificationCommand {
+            actor: boss.id(),
+            request: req_id,
+            reason: Some(DecisionReason::parse("аккаунт слишком новый").unwrap()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.request(req_id).status(), RequestStatus::Rejected);
+        assert!(!store.user(requester.id()).verified().is_verified());
+    }
+
+    #[tokio::test]
+    async fn cannot_approve_already_decided() {
+        let boss = admin("boss3");
+        let requester = member("hopeful4");
+        let mut req = pending_for(requester.id());
+        req.reject(boss.id(), None, Timestamp::now()).unwrap();
+        let req_id = req.id();
+        let store = FakeVerStore::new(vec![boss.clone(), requester.clone()], vec![req]);
+        let err = ApproveVerification::new(
+            FakeDecisionFactory(store.clone()),
+            FixedClock(Timestamp::now()),
+        )
+        .execute(ApproveVerificationCommand {
+            actor: boss.id(),
+            request: req_id,
+            reason: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Verification(VerificationError::AlreadyDecided)
+        ));
     }
 }
