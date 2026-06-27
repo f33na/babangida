@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use babangida_application::query::{FeedItemView, FeedReadModel, ProfileReadModel, ProfileView};
 use babangida_domain::RepositoryError;
 use babangida_domain::content::{Post, PostBody, PostId, PostRepository};
+use babangida_domain::identity::UserId;
 use babangida_shared::{Id, Timestamp};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -80,10 +81,15 @@ impl PgFeedReadModel {
 
 #[async_trait]
 impl FeedReadModel for PgFeedReadModel {
-    async fn recent(&self, limit: u32) -> Result<Vec<FeedItemView>, RepositoryError> {
+    async fn recent(
+        &self,
+        viewer: Option<UserId>,
+        limit: u32,
+    ) -> Result<Vec<FeedItemView>, RepositoryError> {
         // Анти-ВК: посты сообществ — в общей ленте (ADR-0012). Личные посты (без
-        // связи) и посты пабликов видны всем; посты закрытых групп в анонимную
-        // ленту не попадают (только участникам — отдельный экран позже).
+        // связи) и посты пабликов видны всем; пост закрытой группы виден только её
+        // участнику ($1) — зеркало доменного read-правила (closed = участники). При
+        // анонимной выдаче ($1 IS NULL) закрытые группы отсекаются.
         let rows: Vec<(
             Uuid,
             Uuid,
@@ -98,9 +104,14 @@ impl FeedReadModel for PgFeedReadModel {
              JOIN users u ON u.id = p.author_id \
              LEFT JOIN group_posts gp ON gp.post_id = p.id \
              LEFT JOIN groups g ON g.id = gp.group_id \
-             WHERE gp.post_id IS NULL OR g.kind = 'public' \
-             ORDER BY p.created_at DESC, p.id DESC LIMIT $1",
+             WHERE gp.post_id IS NULL \
+                OR g.kind = 'public' \
+                OR ($1::uuid IS NOT NULL AND EXISTS ( \
+                     SELECT 1 FROM group_members m \
+                     WHERE m.group_id = g.id AND m.user_id = $1)) \
+             ORDER BY p.created_at DESC, p.id DESC LIMIT $2",
         )
+        .bind(viewer.map(|v| v.as_uuid()))
         .bind(i64::from(limit))
         .fetch_all(&self.db)
         .await

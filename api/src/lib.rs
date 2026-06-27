@@ -5,7 +5,7 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -225,6 +225,39 @@ impl FromRequestParts<AppState> for CurrentUser {
             handle: who.handle,
             verified: who.verified,
         })
+    }
+}
+
+/// Опциональный текущий юзер для публичных чтений с viewer-aware выдачей (лента).
+/// Нет токена / истёкшая / неизвестная сессия → `None` (аноним); сбой хранилища —
+/// наружу как ошибка, чтобы не подменять выдачу залогиненного на анонимную молча.
+impl OptionalFromRequestParts<AppState> for CurrentUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        st: &AppState,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        let Some(raw) = token_from_headers(&parts.headers) else {
+            return Ok(None);
+        };
+        let Ok(token) = SessionToken::parse(&raw) else {
+            return Ok(None);
+        };
+        let uc = Authenticate::new(
+            PgSessionRepository::new(st.db.clone()),
+            PgUserRepository::new(st.db.clone()),
+            SystemClock,
+        );
+        match uc.execute(AuthenticateCommand { token }).await {
+            Ok(who) => Ok(Some(Self {
+                id: who.user,
+                handle: who.handle,
+                verified: who.verified,
+            })),
+            Err(ApplicationError::Auth(_)) => Ok(None),
+            Err(e) => Err(ApiError::App(e)),
+        }
     }
 }
 
@@ -474,11 +507,15 @@ struct FeedItemRes {
 
 async fn feed(
     State(st): State<AppState>,
+    // Лента публична, но при наличии валидной сессии — viewer-aware (посты закрытых
+    // групп зрителя видны). Аноним получает только публичное (ADR-0012).
+    viewer: Option<CurrentUser>,
     Query(params): Query<FeedParams>,
 ) -> Result<Json<Vec<FeedItemRes>>, ApiError> {
     let uc = FeedQuery::new(PgFeedReadModel::new(st.db.clone()));
     let items = uc
         .execute(RecentFeed {
+            viewer: viewer.map(|v| v.id),
             limit: params.limit.unwrap_or(50),
         })
         .await?;

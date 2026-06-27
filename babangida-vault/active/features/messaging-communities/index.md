@@ -65,3 +65,10 @@ read-модели `Inbox`/`Thread`/`Group`, tx-порт членства `GroupM
   UserId, не handle» снято: server-fn `send_message(recipient_handle)` сам резолвит handle→UserId
   через `GET /profiles/{handle}`, UI оперирует только handle. Нав += «сообщения». Анти-ВК: DM
   стартует с профиля и живёт в одном инбоксе, не отдельным мессенджером. ssr+wasm зелёные.
+- 2026-06-27: лента стала viewer-aware (закрыт бэкенд-пробел). Раньше пост закрытой группы
+  не видел никто; теперь его видит участник в общей ленте (зеркало доменного read-правила
+  closed=участники, ADR-0012). `FeedReadModel.recent` += `viewer: Option<UserId>`, SQL +=
+  `EXISTS group_members` под зрителя (анонимной выдаче — только публичное). api: `/feed` берёт
+  `Option<CurrentUser>` (новый `OptionalFromRequestParts` для `CurrentUser`: нет/истёкший токен
+  → аноним, сбой хранилища → наружу). Интеграционный тест: аноним и не-участник пост бункера
+  не видят, участник — видит с меткой группы. Все it-тесты против postgres зелёные.

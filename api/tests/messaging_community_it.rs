@@ -276,6 +276,56 @@ async fn messaging_and_community_end_to_end() {
         "в паблике пишут только модераторы"
     );
 
+    // --- закрытая группа: пост в ленте виден только участнику (viewer-aware) ---
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/groups",
+        Some(json!({ "slug": "bunker", "name": "Бункер", "kind": "closed" })),
+        Some(&alpha),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "основание закрытой группы: {body}");
+    let bunker_id = body["group_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/groups/{bunker_id}/posts"),
+        Some(json!({ "body": "секрет из бункера" })),
+        Some(&alpha),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "пост в закрытую группу: {body}");
+
+    let sees_secret = |feed: &Value| {
+        feed.as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["body"] == "секрет из бункера")
+    };
+
+    // аноним пост закрытой группы НЕ видит
+    let (_, body) = request(&app, "GET", "/feed", None, None).await;
+    assert!(!sees_secret(&body), "аноним не видит пост закрытой группы");
+
+    // не-участник (beta) — тоже не видит
+    let (_, body) = request(&app, "GET", "/feed", None, Some(&beta)).await;
+    assert!(
+        !sees_secret(&body),
+        "не-участник не видит пост закрытой группы"
+    );
+
+    // участник (alpha) видит — с меткой группы
+    let (_, body) = request(&app, "GET", "/feed", None, Some(&alpha)).await;
+    let item = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["body"] == "секрет из бункера")
+        .expect("участник видит пост своей закрытой группы");
+    assert_eq!(item["group_slug"], "bunker", "метка закрытой группы в ленте");
+
     // единственный владелец (alpha) не может выйти → конфликт
     let (status, _) = request(
         &app,

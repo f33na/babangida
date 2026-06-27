@@ -35,11 +35,13 @@ pub struct ProfileView {
     pub verified: bool,
 }
 
-/// Read-модель ленты.
+/// Read-модель ленты. `viewer` — текущий юзер для viewer-aware выдачи (посты его
+/// закрытых групп видны); `None` — анонимная лента (только публичное).
 #[async_trait::async_trait]
 pub trait FeedReadModel: Send + Sync {
     async fn recent(
         &self,
+        viewer: Option<UserId>,
         limit: u32,
     ) -> Result<Vec<FeedItemView>, babangida_domain::RepositoryError>;
 }
@@ -53,8 +55,10 @@ pub trait ProfileReadModel: Send + Sync {
     ) -> Result<Option<ProfileView>, babangida_domain::RepositoryError>;
 }
 
-/// Запрос свежей ленты.
+/// Запрос свежей ленты. `viewer` — `Some` для viewer-aware ленты залогиненного
+/// (видит посты своих закрытых групп), `None` — анонимная (только публичное).
 pub struct RecentFeed {
+    pub viewer: Option<UserId>,
     pub limit: u32,
 }
 
@@ -71,7 +75,10 @@ impl<R: FeedReadModel> FeedQuery<R> {
     /// # Errors
     /// [`ApplicationError`] при сбое read-модели.
     pub async fn execute(&self, query: RecentFeed) -> Result<Vec<FeedItemView>, ApplicationError> {
-        self.feed.recent(query.limit).await.map_err(Into::into)
+        self.feed
+            .recent(query.viewer, query.limit)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -334,7 +341,11 @@ mod tests {
     struct FakeFeed(Vec<FeedItemView>);
     #[async_trait]
     impl FeedReadModel for FakeFeed {
-        async fn recent(&self, limit: u32) -> Result<Vec<FeedItemView>, RepositoryError> {
+        async fn recent(
+            &self,
+            _viewer: Option<UserId>,
+            limit: u32,
+        ) -> Result<Vec<FeedItemView>, RepositoryError> {
             Ok(self.0.iter().take(limit as usize).cloned().collect())
         }
     }
@@ -362,7 +373,13 @@ mod tests {
     #[tokio::test]
     async fn feed_query_respects_limit() {
         let q = FeedQuery::new(FakeFeed(vec![feed_item(), feed_item(), feed_item()]));
-        let items = q.execute(RecentFeed { limit: 2 }).await.unwrap();
+        let items = q
+            .execute(RecentFeed {
+                viewer: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
         assert_eq!(items.len(), 2);
     }
 
