@@ -22,6 +22,7 @@ use babangida_domain::messaging::{
     Conversation, ConversationId, ConversationRepository, MessageBody, MessageId,
     MessageRepository, MessageSent,
 };
+use babangida_domain::music::{Track, TrackDraft, TrackId, TrackRepository, TrackWithdrawn};
 use babangida_domain::social::{DisplayName, Profile, Subculture};
 use babangida_domain::verification::{
     DecisionReason, RequestNote, VerificationApproved, VerificationRejected, VerificationRequest,
@@ -994,6 +995,91 @@ impl<T: VerificationDecisionTxFactory, C: Clock> RejectVerification<T, C> {
     }
 }
 
+/// Выпустить трек (ADR-0017). Гейт верификации (ADR-0010): грузим артиста, читаем
+/// его статус и передаём в домен — решает [`Track::release`]. Анти-ВК: трек живёт в
+/// разделе музыки и профиле той же сети.
+pub struct ReleaseTrackCommand {
+    pub uploader: UserId,
+    pub draft: TrackDraft,
+}
+
+/// Use-case релиза трека. По образцу [`CreateListing`]: `application` читает статус
+/// верификации (I/O), домен держит гейт инвариантом.
+pub struct ReleaseTrack<U, T, C> {
+    users: U,
+    tracks: T,
+    clock: C,
+}
+
+impl<U, T, C> ReleaseTrack<U, T, C>
+where
+    U: UserRepository,
+    T: TrackRepository,
+    C: Clock,
+{
+    pub fn new(users: U, tracks: T, clock: C) -> Self {
+        Self {
+            users,
+            tracks,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: артиста нет, он не верифицирован (`Music`), либо сбой
+    /// хранилища.
+    pub async fn execute(&self, cmd: ReleaseTrackCommand) -> Result<Track, ApplicationError> {
+        let uploader = self
+            .users
+            .find_by_id(cmd.uploader)
+            .await?
+            .ok_or(ApplicationError::NotFound("uploader"))?;
+        let (track, _event) = Track::release(
+            Id::generate(),
+            uploader.id(),
+            uploader.verified(),
+            cmd.draft,
+            self.clock.now(),
+        )?;
+        self.tracks.save(&track).await?;
+        Ok(track)
+    }
+}
+
+/// Снять трек с публикации.
+pub struct WithdrawTrackCommand {
+    pub track: TrackId,
+    pub actor: UserId,
+}
+
+/// Use-case снятия. Право — у домена ([`Track::withdraw`]): только автор, только из
+/// опубликованного.
+pub struct WithdrawTrack<T> {
+    tracks: T,
+}
+
+impl<T: TrackRepository> WithdrawTrack<T> {
+    pub fn new(tracks: T) -> Self {
+        Self { tracks }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: трека нет, не автор, уже снят, либо сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: WithdrawTrackCommand,
+    ) -> Result<TrackWithdrawn, ApplicationError> {
+        let mut track = self
+            .tracks
+            .find_by_id(cmd.track)
+            .await?
+            .ok_or(ApplicationError::NotFound("track"))?;
+        let event = track.withdraw(cmd.actor)?;
+        self.tracks.save(&track).await?;
+        Ok(event)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1007,6 +1093,7 @@ mod tests {
     use babangida_domain::identity::{InviteError, InviteQuota};
     use babangida_domain::marketplace::{ListingTitle, MarketplaceError, Price};
     use babangida_domain::messaging::{Message, MessagingError};
+    use babangida_domain::music::{AudioRef, MusicError, TrackStatus, TrackTitle};
     use babangida_domain::verification::{RequestStatus, VerificationError};
     use babangida_shared::{Duration, Timestamp};
 
@@ -2278,5 +2365,147 @@ mod tests {
             err,
             ApplicationError::Verification(VerificationError::AlreadyDecided)
         ));
+    }
+
+    // --- music: релиз/снятие за гейтом верификации (ADR-0017) ---
+
+    struct FakeTracks {
+        saved: Arc<Mutex<Vec<Track>>>,
+    }
+    impl FakeTracks {
+        fn empty() -> Self {
+            Self {
+                saved: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn with(track: Track) -> Self {
+            Self {
+                saved: Arc::new(Mutex::new(vec![track])),
+            }
+        }
+    }
+    #[async_trait]
+    impl TrackRepository for FakeTracks {
+        async fn find_by_id(&self, id: TrackId) -> Result<Option<Track>, RepositoryError> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id() == id)
+                .cloned())
+        }
+        async fn save(&self, track: &Track) -> Result<(), RepositoryError> {
+            let mut v = self.saved.lock().unwrap();
+            v.retain(|t| t.id() != track.id());
+            v.push(track.clone());
+            Ok(())
+        }
+    }
+
+    fn track_draft() -> TrackDraft {
+        TrackDraft {
+            title: TrackTitle::parse("Подвал").unwrap(),
+            audio: AudioRef::parse("https://audio.example/t.mp3").unwrap(),
+            genre: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn casual_artist_cannot_release() {
+        let artist = member("casual_mc");
+        let tracks = FakeTracks::empty();
+        let err = ReleaseTrack::new(
+            FakeUsers::with(vec![artist.clone()]),
+            tracks,
+            FixedClock(Timestamp::now()),
+        )
+        .execute(ReleaseTrackCommand {
+            uploader: artist.id(),
+            draft: track_draft(),
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Music(MusicError::NotVerified)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_artist_releases() {
+        let mut artist = member("real_mc");
+        artist.verify();
+        let tracks = FakeTracks::empty();
+        let track = ReleaseTrack::new(
+            FakeUsers::with(vec![artist.clone()]),
+            FakeTracks {
+                saved: tracks.saved.clone(),
+            },
+            FixedClock(Timestamp::now()),
+        )
+        .execute(ReleaseTrackCommand {
+            uploader: artist.id(),
+            draft: track_draft(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(track.uploader(), artist.id());
+        assert_eq!(tracks.saved.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_uploader_cannot_withdraw() {
+        let mut artist = member("mc_two");
+        artist.verify();
+        let (track, _) = Track::release(
+            Id::generate(),
+            artist.id(),
+            artist.verified(),
+            track_draft(),
+            Timestamp::now(),
+        )
+        .unwrap();
+        let track_id = track.id();
+        let err = WithdrawTrack::new(FakeTracks::with(track))
+            .execute(WithdrawTrackCommand {
+                track: track_id,
+                actor: Id::generate(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Music(MusicError::NotUploader)
+        ));
+    }
+
+    #[tokio::test]
+    async fn uploader_withdraws() {
+        let mut artist = member("mc_three");
+        artist.verify();
+        let (track, _) = Track::release(
+            Id::generate(),
+            artist.id(),
+            artist.verified(),
+            track_draft(),
+            Timestamp::now(),
+        )
+        .unwrap();
+        let track_id = track.id();
+        let tracks = FakeTracks::with(track);
+        WithdrawTrack::new(FakeTracks {
+            saved: tracks.saved.clone(),
+        })
+        .execute(WithdrawTrackCommand {
+            track: track_id,
+            actor: artist.id(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            tracks.saved.lock().unwrap()[0].status(),
+            TrackStatus::Withdrawn
+        );
     }
 }

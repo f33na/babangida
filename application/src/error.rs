@@ -4,6 +4,7 @@ use babangida_domain::community::CommunityError;
 use babangida_domain::identity::InviteError;
 use babangida_domain::marketplace::MarketplaceError;
 use babangida_domain::messaging::MessagingError;
+use babangida_domain::music::MusicError;
 use babangida_domain::verification::VerificationError;
 
 /// Ошибка прикладного слоя. Оборачивает доменные нарушения и сбои портов, чтобы
@@ -25,6 +26,9 @@ pub enum ApplicationError {
     /// Нарушение правила барахолки (гейт верификации, права продавца, статус).
     #[error(transparent)]
     Marketplace(#[from] MarketplaceError),
+    /// Нарушение правила музыки (гейт верификации, права автора, статус).
+    #[error(transparent)]
+    Music(#[from] MusicError),
     /// Нарушение правила верификации (заявка уже рассмотрена).
     #[error(transparent)]
     Verification(#[from] VerificationError),

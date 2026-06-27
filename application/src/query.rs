@@ -7,6 +7,7 @@ use babangida_domain::content::PostId;
 use babangida_domain::identity::UserId;
 use babangida_domain::marketplace::ListingId;
 use babangida_domain::messaging::{ConversationId, MessageId};
+use babangida_domain::music::TrackId;
 use babangida_domain::verification::VerificationRequestId;
 use babangida_shared::Timestamp;
 
@@ -415,6 +416,83 @@ impl<R: VerificationReadModel> MyVerificationQuery<R> {
     ) -> Result<Option<MyVerificationView>, ApplicationError> {
         self.requests
             .latest_for(query.requester)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+// --- music: общий раздел и треки артиста (ADR-0010/0017) ---
+
+/// Карточка трека под раздел музыки/профиль.
+#[derive(Debug, Clone)]
+pub struct TrackView {
+    pub track_id: TrackId,
+    pub uploader: UserId,
+    pub artist_handle: String,
+    pub title: String,
+    pub audio_url: String,
+    pub genre: Option<String>,
+    pub status: String,
+    pub created_at: Timestamp,
+}
+
+/// Read-модель треков.
+#[async_trait::async_trait]
+pub trait MusicReadModel: Send + Sync {
+    /// Опубликованные треки — общий раздел музыки.
+    async fn recent(&self, limit: u32)
+    -> Result<Vec<TrackView>, babangida_domain::RepositoryError>;
+    /// Треки артиста по его handle — на профиль (анти-ВК).
+    async fn by_artist(
+        &self,
+        handle: &str,
+        limit: u32,
+    ) -> Result<Vec<TrackView>, babangida_domain::RepositoryError>;
+}
+
+/// Запрос общего раздела музыки (опубликованные треки).
+pub struct MusicBrowse {
+    pub limit: u32,
+}
+
+/// Use-case чтения раздела музыки.
+pub struct MusicQuery<R> {
+    tracks: R,
+}
+
+impl<R: MusicReadModel> MusicQuery<R> {
+    pub fn new(tracks: R) -> Self {
+        Self { tracks }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое read-модели.
+    pub async fn execute(&self, query: MusicBrowse) -> Result<Vec<TrackView>, ApplicationError> {
+        self.tracks.recent(query.limit).await.map_err(Into::into)
+    }
+}
+
+/// Запрос треков артиста по handle.
+pub struct ArtistTracks {
+    pub handle: String,
+    pub limit: u32,
+}
+
+/// Use-case чтения треков артиста.
+pub struct ArtistTracksQuery<R> {
+    tracks: R,
+}
+
+impl<R: MusicReadModel> ArtistTracksQuery<R> {
+    pub fn new(tracks: R) -> Self {
+        Self { tracks }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое read-модели.
+    pub async fn execute(&self, query: ArtistTracks) -> Result<Vec<TrackView>, ApplicationError> {
+        self.tracks
+            .by_artist(&query.handle, query.limit)
             .await
             .map_err(Into::into)
     }

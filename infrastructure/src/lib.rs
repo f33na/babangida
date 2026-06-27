@@ -11,6 +11,7 @@ mod identity;
 mod invite_code;
 mod marketplace;
 mod messaging;
+mod music;
 mod pool;
 mod verification;
 
@@ -28,6 +29,7 @@ pub use marketplace::{PgListingReadModel, PgListingRepository};
 pub use messaging::{
     PgConversationRepository, PgInboxReadModel, PgMessageRepository, PgThreadReadModel,
 };
+pub use music::{PgMusicReadModel, PgTrackRepository};
 pub use pool::{Db, connect, run_migrations};
 pub use verification::{
     PgVerificationDecisionTxFactory, PgVerificationReadModel, PgVerificationRequestRepository,

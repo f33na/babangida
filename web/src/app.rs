@@ -9,6 +9,7 @@
 
 use babangida_uikit::{
     Avatar, Badge, Button, ButtonVariant, Card, FeedItem, Field, ListingCard, Nav, TextArea,
+    TrackCard,
 };
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
@@ -65,6 +66,7 @@ pub fn App() -> impl IntoView {
         <Router>
             <Nav>
                 <A href="/">"лента"</A>
+                <A href="/music">"музыка"</A>
                 <A href="/market">"маркет"</A>
                 <A href="/messages">"сообщения"</A>
                 <A href="/verification">"верификация"</A>
@@ -81,6 +83,7 @@ pub fn App() -> impl IntoView {
             <main class="max-w-2xl mx-auto">
                 <Routes fallback=|| view! { <p class="p-4">"не найдено"</p> }>
                     <Route path=path!("/") view=FeedPage />
+                    <Route path=path!("/music") view=MusicPage />
                     <Route path=path!("/market") view=MarketPage />
                     <Route path=path!("/u/:handle") view=ProfilePage />
                     <Route path=path!("/g/:slug") view=GroupPage />
@@ -168,6 +171,17 @@ pub struct VerificationQueueItemDto {
     requester_handle: String,
     #[serde(default)]
     note: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TrackDto {
+    track_id: String,
+    title: String,
+    artist_handle: String,
+    audio_url: String,
+    #[serde(default)]
+    genre: Option<String>,
+    status: String,
 }
 
 #[cfg(feature = "ssr")]
@@ -686,6 +700,89 @@ async fn verification_decision(
     }
 }
 
+// --- музыка (ADR-0017: релиз за гейтом верификации; чтение публичное) ---
+
+/// Общий раздел музыки — опубликованные треки (публичное чтение).
+#[server]
+async fn fetch_music() -> Result<Vec<TrackDto>, ServerFnError> {
+    reqwest::get(format!("{}/music", api_base()))
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .json::<Vec<TrackDto>>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Треки артиста (публичное чтение): для профиля.
+#[server]
+async fn fetch_artist_tracks(handle: String) -> Result<Vec<TrackDto>, ServerFnError> {
+    let resp = reqwest::get(format!("{}/profiles/{handle}/tracks", api_base()))
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    resp.json::<Vec<TrackDto>>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Выложить трек (Bearer; только верифицированный). Жанр пустой → без жанра (api сам
+/// отсекает).
+#[server]
+async fn release_track(
+    title: String,
+    audio_url: String,
+    genre: String,
+) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/tracks", api_base()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "title": title, "audio_url": audio_url, "genre": genre }))
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        403 => Err(ServerFnError::new(
+            "релизить может только verified — пройди верификацию".to_string(),
+        )),
+        422 => Err(ServerFnError::new(
+            "проверь название и ссылку (http/https)".to_string(),
+        )),
+        _ => Err(ServerFnError::new("не удалось выложить трек".to_string())),
+    }
+}
+
+/// Снять свой трек (Bearer; только автор).
+#[server]
+async fn withdraw_track(track_id: String) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/tracks/{track_id}/withdraw", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        403 => Err(ServerFnError::new("это не твой трек".to_string())),
+        409 => Err(ServerFnError::new("трек уже снят".to_string())),
+        _ => Err(ServerFnError::new("не удалось снять трек".to_string())),
+    }
+}
+
 // --- нав: текущий юзер ---
 
 #[component]
@@ -903,6 +1000,120 @@ fn MarketPage() -> impl IntoView {
 }
 
 #[component]
+fn MusicPage() -> impl IntoView {
+    let release = ServerAction::<ReleaseTrack>::new();
+    let released = release.value();
+    let me = Resource::new(|| (), |()| fetch_me());
+    // Раздел перечитывается после успешного релиза.
+    let music = Resource::new(move || release.version().get(), |_| fetch_music());
+    view! {
+        <div class="p-4 flex flex-col gap-4">
+            // Релиз — за гейтом верификации: форму видит только verified; иначе подсказка.
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    match me.await.ok().flatten() {
+                        Some(m) if m.verified => {
+                            view! {
+                                <Card>
+                                    <h1 class="text-lg font-bold mb-3">"выложить трек"</h1>
+                                    <ActionForm action=release attr:class="flex flex-col gap-3">
+                                        <Field name="title" label="название" placeholder="Подвал" />
+                                        <Field
+                                            name="audio_url"
+                                            label="ссылка на аудио"
+                                            placeholder="https://…/track.mp3"
+                                        />
+                                        <Field
+                                            name="genre"
+                                            label="жанр (необязательно)"
+                                            placeholder="boom bap"
+                                        />
+                                        <Button submit=true variant=ButtonVariant::Primary>
+                                            "выложить"
+                                        </Button>
+                                    </ActionForm>
+                                    {move || match released.get() {
+                                        Some(Ok(())) => {
+                                            view! { <p class="mt-2 text-[var(--accent)]">"трек выложен"</p> }
+                                                .into_any()
+                                        }
+                                        Some(Err(e)) => {
+                                            view! { <p class="mt-2 text-[var(--danger)]">{e.to_string()}</p> }
+                                                .into_any()
+                                        }
+                                        None => ().into_any(),
+                                    }}
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        Some(_) => {
+                            view! {
+                                <Card>
+                                    <p class="text-sm text-[var(--text-muted)]">
+                                        "выкладывать музыку могут только verified — "
+                                        <A href="/verification">"пройди верификацию"</A>
+                                    </p>
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        None => {
+                            view! {
+                                <Card>
+                                    <p class="text-sm text-[var(--text-muted)]">
+                                        <A href="/login">"войди"</A>
+                                        ", чтобы выкладывать музыку"
+                                    </p>
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+            <Suspense fallback=move || {
+                view! { <p class="text-[var(--text-muted)]">"загрузка музыки…"</p> }
+            }>
+                {move || Suspend::new(async move {
+                    match music.await {
+                        Ok(items) if items.is_empty() => {
+                            view! { <p class="text-[var(--text-muted)]">"пока тихо"</p> }.into_any()
+                        }
+                        Ok(items) => {
+                            view! {
+                                <div class="flex flex-col gap-3">
+                                    {items
+                                        .into_iter()
+                                        .map(|t| {
+                                            view! {
+                                                <TrackCard
+                                                    title=t.title
+                                                    artist_handle=t.artist_handle
+                                                    genre=t.genre
+                                                    audio_url=t.audio_url
+                                                />
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        Err(_) => {
+                            view! {
+                                <p class="text-[var(--danger)]">"не удалось загрузить музыку"</p>
+                            }
+                                .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+        </div>
+    }
+}
+
+#[component]
 fn VerificationPage() -> impl IntoView {
     let request = ServerAction::<RequestVerification>::new();
     let approve = ServerAction::<ApproveVerification>::new();
@@ -1075,6 +1286,7 @@ fn ProfilePage() -> impl IntoView {
     let handle = move || params.read().get("handle").unwrap_or_default();
     let sold = ServerAction::<MarkSold>::new();
     let withdraw = ServerAction::<Withdraw>::new();
+    let withdraw_track = ServerAction::<WithdrawTrack>::new();
     let send = ServerAction::<SendMessage>::new();
     let sent = send.value();
     let profile = Resource::new(handle, fetch_profile);
@@ -1083,6 +1295,11 @@ fn ProfilePage() -> impl IntoView {
     let listings = Resource::new(
         move || (handle(), sold.version().get(), withdraw.version().get()),
         |(h, _, _)| fetch_seller_listings(h),
+    );
+    // Треки перечитываются после снятия.
+    let tracks = Resource::new(
+        move || (handle(), withdraw_track.version().get()),
+        |(h, _)| fetch_artist_tracks(h),
     );
     // Ошибка последнего действия над товаром (реактивно, вне Suspense).
     let action_error = move || {
@@ -1263,6 +1480,60 @@ fn ProfilePage() -> impl IntoView {
                             }
                                 .into_any()
                         }
+                    }
+                })}
+            </Suspense>
+            // Треки артиста (анти-ВК: музыка живёт в профиле). Снять может только автор.
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    let my_handle = me.await.ok().flatten().map(|m| m.handle);
+                    match tracks.await {
+                        Ok(items) if items.is_empty() => ().into_any(),
+                        Ok(items) => {
+                            view! {
+                                <div class="flex flex-col gap-3">
+                                    <h2 class="font-bold text-[var(--text)]">"музыка"</h2>
+                                    {items
+                                        .into_iter()
+                                        .map(|t| {
+                                            let owner = my_handle.as_deref()
+                                                == Some(t.artist_handle.as_str());
+                                            let action = owner
+                                                .then(|| {
+                                                    let id = t.track_id.clone();
+                                                    view! {
+                                                        <ActionForm
+                                                            action=withdraw_track
+                                                            attr:class="inline pl-1"
+                                                        >
+                                                            <input type="hidden" name="track_id" value=id />
+                                                            <button
+                                                                type="submit"
+                                                                class="text-sm text-[var(--text-muted)] hover:text-[var(--text)]"
+                                                            >
+                                                                "снять"
+                                                            </button>
+                                                        </ActionForm>
+                                                    }
+                                                });
+                                            view! {
+                                                <div class="flex flex-col gap-1">
+                                                    <TrackCard
+                                                        title=t.title
+                                                        artist_handle=t.artist_handle
+                                                        genre=t.genre
+                                                        audio_url=t.audio_url
+                                                    />
+                                                    {action}
+                                                </div>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        Err(_) => ().into_any(),
                     }
                 })}
             </Suspense>

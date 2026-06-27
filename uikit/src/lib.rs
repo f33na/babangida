@@ -12,6 +12,7 @@ mod components;
 #[cfg(feature = "leptos")]
 pub use components::{
     Avatar, Badge, Button, ButtonVariant, Card, FeedItem, Field, ListingCard, Nav, TextArea,
+    TrackCard,
 };
 
 #[cfg(feature = "dioxus")]

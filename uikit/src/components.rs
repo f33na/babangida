@@ -180,6 +180,37 @@ pub fn Badge(#[prop(optional)] accent: bool, children: Children) -> impl IntoVie
     view! { <span class=cls>{children()}</span> }
 }
 
+/// Карточка трека: название, артист, опц. жанр, ссылка на прослушивание (внешний URL).
+/// Презентационная; действия владельца (снять) — на стороне приложения.
+#[component]
+pub fn TrackCard(
+    #[prop(into)] title: String,
+    #[prop(into)] artist_handle: String,
+    #[prop(default = None)] genre: Option<String>,
+    #[prop(into)] audio_url: String,
+) -> impl IntoView {
+    view! {
+        <div class="bg-[var(--surface)] border border-[var(--border)] rounded-[var(--radius-lg)] \
+                    p-4 flex flex-col gap-1">
+            <div class="flex items-start justify-between gap-3">
+                <span class="font-semibold text-[var(--text)] break-words">{title}</span>
+                <a
+                    href=audio_url
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="font-bold text-[var(--accent)] hover:underline whitespace-nowrap"
+                >
+                    "слушать ▸"
+                </a>
+            </div>
+            <div class="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+                "@"{artist_handle}
+                {genre.map(|g| view! { <Badge>{g}</Badge> })}
+            </div>
+        </div>
+    }
+}
+
 /// Карточка товара барахолки: заголовок, цена в рублях, продавец, статус (если не активен).
 #[component]
 pub fn ListingCard(

@@ -18,15 +18,17 @@ use babangida_application::command::{
     EstablishCredentialCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand,
     JoinGroup, JoinGroupCommand, LeaveGroup, LeaveGroupCommand, LogIn, LogInCommand, LogOut,
     LogOutCommand, MarkListingSold, MarkListingSoldCommand, PostToGroup, PostToGroupCommand,
-    Register, RegisterCommand, RejectVerification, RejectVerificationCommand, RequestVerification,
-    RequestVerificationCommand, SendMessage, SendMessageCommand, SetMemberRole,
-    SetMemberRoleCommand, VerifyUser, VerifyUserCommand, WithdrawListing, WithdrawListingCommand,
+    Register, RegisterCommand, RejectVerification, RejectVerificationCommand, ReleaseTrack,
+    ReleaseTrackCommand, RequestVerification, RequestVerificationCommand, SendMessage,
+    SendMessageCommand, SetMemberRole, SetMemberRoleCommand, VerifyUser, VerifyUserCommand,
+    WithdrawListing, WithdrawListingCommand, WithdrawTrack, WithdrawTrackCommand,
 };
 use babangida_application::query::{
-    FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf, InboxQuery, ListingView, MarketBrowse,
-    MarketQuery, MyVerificationOf, MyVerificationQuery, PendingVerifications,
-    PendingVerificationsQuery, ProfileByHandle, ProfileQuery, ProfileView, RecentFeed,
-    SellerListings, SellerListingsQuery, ThreadOf, ThreadQuery,
+    ArtistTracks, ArtistTracksQuery, FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf,
+    InboxQuery, ListingView, MarketBrowse, MarketQuery, MusicBrowse, MusicQuery, MyVerificationOf,
+    MyVerificationQuery, PendingVerifications, PendingVerificationsQuery, ProfileByHandle,
+    ProfileQuery, ProfileView, RecentFeed, SellerListings, SellerListingsQuery, ThreadOf,
+    ThreadQuery, TrackView,
 };
 use babangida_domain::RepositoryError;
 use babangida_domain::auth::{AuthError, Password, SESSION_TTL, SessionToken};
@@ -41,16 +43,18 @@ use babangida_domain::marketplace::{
     ListingDescription, ListingDraft, ListingId, ListingTitle, MarketplaceError, Price,
 };
 use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
+use babangida_domain::music::{AudioRef, Genre, MusicError, TrackDraft, TrackId, TrackTitle};
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_domain::verification::{DecisionReason, RequestNote, VerificationRequestId};
 use babangida_infrastructure::{
     Argon2PasswordHasher, Db, PgConversationRepository, PgCredentialRepository, PgFeedReadModel,
     PgGroupMembershipTxFactory, PgGroupPostRepository, PgGroupReadModel, PgGroupRepository,
     PgInboxReadModel, PgIssueInviteTxFactory, PgListingReadModel, PgListingRepository,
-    PgMessageRepository, PgPostRepository, PgProfileReadModel, PgRegistrationTxFactory,
-    PgSessionRepository, PgThreadReadModel, PgUserRepository, PgVerificationDecisionTxFactory,
-    PgVerificationReadModel, PgVerificationRequestRepository, RandomInviteCodeFactory,
-    RandomSessionTokenFactory, SystemClock,
+    PgMessageRepository, PgMusicReadModel, PgPostRepository, PgProfileReadModel,
+    PgRegistrationTxFactory, PgSessionRepository, PgThreadReadModel, PgTrackRepository,
+    PgUserRepository, PgVerificationDecisionTxFactory, PgVerificationReadModel,
+    PgVerificationRequestRepository, RandomInviteCodeFactory, RandomSessionTokenFactory,
+    SystemClock,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -90,6 +94,11 @@ pub fn router(state: AppState) -> Router {
         .route("/listings/{id}/withdraw", post(withdraw_listing))
         .route("/market", get(market))
         .route("/profiles/{handle}/listings", get(seller_listings))
+        // music (релиз — за гейтом верификации; чтение — публичное)
+        .route("/tracks", post(release_track))
+        .route("/tracks/{id}/withdraw", post(withdraw_track))
+        .route("/music", get(music))
+        .route("/profiles/{handle}/tracks", get(artist_tracks))
         // верификация (ADR-0010/0016): заявка от юзера, очередь и решение — у админа;
         // прямой грант остаётся как админ-override.
         .route("/users/{handle}/verify", post(verify_user))
@@ -194,6 +203,13 @@ fn app_error_response(err: ApplicationError) -> (StatusCode, String) {
             e @ (MarketplaceError::NotVerified | MarketplaceError::NotSeller),
         ) => (StatusCode::FORBIDDEN, e.to_string()),
         ApplicationError::Marketplace(e @ MarketplaceError::NotActive) => {
+            (StatusCode::CONFLICT, e.to_string())
+        }
+        // Музыка: гейт верификации и право автора — запрещено; снятый трек — конфликт.
+        ApplicationError::Music(e @ (MusicError::NotVerified | MusicError::NotUploader)) => {
+            (StatusCode::FORBIDDEN, e.to_string())
+        }
+        ApplicationError::Music(e @ MusicError::NotPublished) => {
             (StatusCode::CONFLICT, e.to_string())
         }
         // Верификация: повторное решение по заявке — конфликт состояния.
@@ -972,6 +988,128 @@ async fn seller_listings(
         })
         .await?;
     Ok(Json(items.into_iter().map(ListingRes::from).collect()))
+}
+
+// --- music (релиз за гейтом верификации; чтение публичное, ADR-0017) ---
+
+#[derive(Deserialize)]
+struct TrackReq {
+    title: String,
+    audio_url: String,
+    genre: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReleasedTrackRes {
+    track_id: String,
+    status: String,
+    created_at: i64,
+}
+
+async fn release_track(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Json(req): Json<TrackReq>,
+) -> Result<Json<ReleasedTrackRes>, ApiError> {
+    let genre = req
+        .genre
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Genre::parse)
+        .transpose()
+        .map_err(invalid)?;
+    let draft = TrackDraft {
+        title: TrackTitle::parse(&req.title).map_err(invalid)?,
+        audio: AudioRef::parse(&req.audio_url).map_err(invalid)?,
+        genre,
+    };
+    let uc = ReleaseTrack::new(
+        PgUserRepository::new(st.db.clone()),
+        PgTrackRepository::new(st.db.clone()),
+        SystemClock,
+    );
+    let track = uc
+        .execute(ReleaseTrackCommand {
+            uploader: current.id,
+            draft,
+        })
+        .await?;
+    Ok(Json(ReleasedTrackRes {
+        track_id: track.id().to_string(),
+        status: track.status().as_str().to_owned(),
+        created_at: track.created_at().into_offset().unix_timestamp(),
+    }))
+}
+
+async fn withdraw_track(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let track = TrackId::parse(&id).map_err(invalid)?;
+    WithdrawTrack::new(PgTrackRepository::new(st.db.clone()))
+        .execute(WithdrawTrackCommand {
+            track,
+            actor: current.id,
+        })
+        .await?;
+    Ok(Json(json!({ "track_id": id, "status": "withdrawn" })))
+}
+
+#[derive(Serialize)]
+struct TrackRes {
+    track_id: String,
+    uploader: String,
+    artist_handle: String,
+    title: String,
+    audio_url: String,
+    genre: Option<String>,
+    status: String,
+    created_at: i64,
+}
+
+impl From<TrackView> for TrackRes {
+    fn from(v: TrackView) -> Self {
+        Self {
+            track_id: v.track_id.to_string(),
+            uploader: v.uploader.to_string(),
+            artist_handle: v.artist_handle,
+            title: v.title,
+            audio_url: v.audio_url,
+            genre: v.genre,
+            status: v.status,
+            created_at: v.created_at.into_offset().unix_timestamp(),
+        }
+    }
+}
+
+async fn music(
+    State(st): State<AppState>,
+    Query(params): Query<FeedParams>,
+) -> Result<Json<Vec<TrackRes>>, ApiError> {
+    let uc = MusicQuery::new(PgMusicReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(MusicBrowse {
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    Ok(Json(items.into_iter().map(TrackRes::from).collect()))
+}
+
+async fn artist_tracks(
+    State(st): State<AppState>,
+    Path(handle): Path<String>,
+    Query(params): Query<FeedParams>,
+) -> Result<Json<Vec<TrackRes>>, ApiError> {
+    let uc = ArtistTracksQuery::new(PgMusicReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(ArtistTracks {
+            handle,
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    Ok(Json(items.into_iter().map(TrackRes::from).collect()))
 }
 
 async fn verify_user(
