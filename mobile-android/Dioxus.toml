@@ -1,0 +1,18 @@
+# Конфиг сборки под устройство для `dx` (Dioxus CLI). Читается только `dx`, НЕ cargo —
+# `cargo check/clippy/test` его игнорируют. Реальная сборка .apk требует Android SDK/NDK
+# и JDK; в этом окружении не собирается — риск ADR-0007.
+#
+# Пререквизиты: Android SDK + NDK (ANDROID_HOME/NDK_HOME), JDK, таргеты
+# `aarch64-linux-android` (+ прочие abis), Dioxus CLI (`cargo install dioxus-cli`).
+# Запуск на устройстве/эмуляторе: `dx serve --platform android`
+# Сборка релиза:                  `dx build --platform android --release`
+
+[application]
+name = "babangida"
+
+[bundle]
+identifier = "com.babangida.app"
+
+[android]
+min_sdk = 24
+target_sdk = 34

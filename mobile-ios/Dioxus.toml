@@ -1,0 +1,17 @@
+# Конфиг сборки под устройство для `dx` (Dioxus CLI). Читается только `dx`, НЕ cargo —
+# `cargo check/clippy/test` его игнорируют. Реальная сборка .ipa требует Xcode и подписи
+# (Apple Developer ID/provisioning); в этом окружении не собирается — риск ADR-0007.
+#
+# Пререквизиты: Xcode + командные тулзы, таргет `aarch64-apple-ios` (+ `…-sim`),
+# Dioxus CLI (`cargo binstall dioxus-cli` / `cargo install dioxus-cli`).
+# Запуск в симуляторе: `dx serve --platform ios`
+# Сборка релиза:        `dx build --platform ios --release`
+
+[application]
+name = "babangida"
+
+[bundle]
+identifier = "com.babangida.app"
+
+[ios]
+deployment_target = "15.0"

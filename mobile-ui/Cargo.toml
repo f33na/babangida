@@ -10,12 +10,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# Общий mobile-UI (ADR-0015): Dioxus-экраны + сигнальная навигация + data-client.
-# Шеллы mobile-ios/-android делегируют сюда; нативный рендерер включают они (фича
-# `shell`). Шарит токены и Dioxus-виджеты `uikit` (ADR-0008).
+# Общий mobile-UI (ADR-0015): Dioxus-экраны + роутер + data-client. Шеллы
+# mobile-ios/-android делегируют сюда; нативный рендерер включают они (фича `shell`).
+# Шарит токены/тему и Dioxus-виджеты `uikit` (ADR-0008).
 babangida-uikit = { workspace = true, features = ["dioxus"] }
-dioxus.workspace = true
+dioxus = { workspace = true, features = ["router"] }
 # Данные — прямой HTTP к тому же API, что и web (ADR-0015), без SSR/server-функций.
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# Секьюр-стор токена сессии (ADR-0015). На Android keyring не собирается — там путь к
+# Android Keystore через JNI (заглушка в src/store.rs), поэтому зависимость только не-Android.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = { workspace = true }

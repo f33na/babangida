@@ -4,6 +4,7 @@
 //! Dioxus в модуле [`dx`] (фича `dioxus`, mobile). CSS-тема web — `theme.css`.
 //! См. `../../babangida-vault/stable/design-system.md`.
 
+pub mod theme;
 pub mod tokens;
 
 #[cfg(feature = "leptos")]
@@ -20,5 +21,5 @@ mod components_dioxus;
 /// (`FeedItem`) не сталкивались с Leptos-версией в корне крейта.
 #[cfg(feature = "dioxus")]
 pub mod dx {
-    pub use super::components_dioxus::{Button, FeedItem, Field};
+    pub use super::components_dioxus::{Badge, Button, Card, FeedItem, Field};
 }

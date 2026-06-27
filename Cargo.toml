@@ -47,13 +47,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Базовый dioxus — ядро без рендерера (rsx!/компоненты/сигналы), собирается на любом
 # хосте. Нативный рендерер (`mobile`) крейты `mobile-*` включают сами под фичей `shell`
 # (нужен device-тулчейн, ADR-0007). uikit (фича `dioxus`) — только это ядро.
-dioxus = { version = "0.6", default-features = false, features = ["macro", "html", "signals", "hooks"] }
+dioxus = { version = "0.7", default-features = false, features = ["macro", "html", "signals", "hooks"] }
 # cross-cutting
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # auth: хэширование паролей (argon2id) и генерация токенов сессий — на границе (ADR-0013)
 argon2 = "0.5"
 rand = "0.8"
+# mobile secure-store токена сессии (ADR-0015): Keychain (iOS/macOS) и пр. Android
+# не поддерживается — там отдельный JNI-путь к Keystore (см. mobile-ui/src/store.rs).
+keyring = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["macros"] }
