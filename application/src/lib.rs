@@ -13,7 +13,8 @@ pub mod query;
 
 pub use error::ApplicationError;
 pub use ports::{
-    Clock, GroupMembershipTx, GroupMembershipTxFactory, InviteCodeFactory, InviterIssuanceState,
-    IssueInviteTx, IssueInviteTxFactory, PasswordHasher, RegistrationTx, RegistrationTxFactory,
-    SessionTokenFactory, VerificationDecisionTx, VerificationDecisionTxFactory,
+    ApiKeyFactory, ApiKeyHasher, Clock, GroupMembershipTx, GroupMembershipTxFactory,
+    InviteCodeFactory, InviterIssuanceState, IssueInviteTx, IssueInviteTxFactory, PasswordHasher,
+    RegistrationTx, RegistrationTxFactory, SessionTokenFactory, VerificationDecisionTx,
+    VerificationDecisionTxFactory,
 };

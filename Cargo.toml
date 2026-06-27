@@ -54,6 +54,8 @@ serde_json = "1"
 # auth: хэширование паролей (argon2id) и генерация токенов сессий — на границе (ADR-0013)
 argon2 = "0.5"
 rand = "0.8"
+# openapi: быстрый хэш API-ключей (SHA-256) для O(1)-поиска при аутентификации (ADR-0018)
+sha2 = "0.10"
 # mobile secure-store токена сессии (ADR-0015): Keychain (iOS/macOS) и пр. Android
 # не поддерживается — там отдельный JNI-путь к Keystore (см. mobile-ui/src/store.rs).
 keyring = "3"

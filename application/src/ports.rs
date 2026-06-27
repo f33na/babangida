@@ -6,6 +6,7 @@ use babangida_domain::RepositoryError;
 use babangida_domain::auth::{Credential, Password, PasswordHash, SessionToken};
 use babangida_domain::community::{Group, GroupId};
 use babangida_domain::identity::{Invite, InviteCode, InviteQuota, User, UserId};
+use babangida_domain::openapi::{ApiKeyHash, ApiKeyToken};
 use babangida_domain::social::Profile;
 use babangida_domain::verification::{VerificationRequest, VerificationRequestId};
 use babangida_shared::Timestamp;
@@ -38,6 +39,21 @@ pub trait PasswordHasher: Send + Sync {
 pub trait SessionTokenFactory: Send + Sync {
     /// Сгенерировать новый высокоэнтропийный токен.
     fn generate(&self) -> SessionToken;
+}
+
+/// Генератор секретов API-ключей (ADR-0018). Энтропия — на границе; домен формат
+/// только валидирует ([`ApiKeyToken::parse`]).
+pub trait ApiKeyFactory: Send + Sync {
+    /// Сгенерировать новый высокоэнтропийный токен ключа (показывается владельцу раз).
+    fn generate(&self) -> ApiKeyToken;
+}
+
+/// Хэширование секрета ключа для хранения и поиска при аутентификации (ADR-0018).
+/// Быстрый хэш (SHA-256): ключ высокоэнтропийный, медленный argon2 (для паролей) не
+/// нужен, а O(1)-поиск по хэшу важен на каждом запросе `/api/v1`.
+pub trait ApiKeyHasher: Send + Sync {
+    /// Захэшировать токен (детерминированно — один токен даёт один хэш).
+    fn hash(&self, token: &ApiKeyToken) -> ApiKeyHash;
 }
 
 /// Состояние инвайтера, прочитанное ПОД блокировкой строки (для инварианта выдачи,

@@ -12,6 +12,7 @@ mod invite_code;
 mod marketplace;
 mod messaging;
 mod music;
+mod openapi;
 mod pool;
 mod verification;
 
@@ -30,6 +31,7 @@ pub use messaging::{
     PgConversationRepository, PgInboxReadModel, PgMessageRepository, PgThreadReadModel,
 };
 pub use music::{PgMusicReadModel, PgTrackRepository};
+pub use openapi::{PgApiKeyReadModel, PgApiKeyRepository, RandomApiKeyFactory, Sha256ApiKeyHasher};
 pub use pool::{Db, connect, run_migrations};
 pub use verification::{
     PgVerificationDecisionTxFactory, PgVerificationReadModel, PgVerificationRequestRepository,

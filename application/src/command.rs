@@ -23,6 +23,9 @@ use babangida_domain::messaging::{
     MessageRepository, MessageSent,
 };
 use babangida_domain::music::{Track, TrackDraft, TrackId, TrackRepository, TrackWithdrawn};
+use babangida_domain::openapi::{
+    ApiKey, ApiKeyId, ApiKeyLabel, ApiKeyRepository, ApiKeyRevoked, ApiKeyToken,
+};
 use babangida_domain::social::{DisplayName, Profile, Subculture};
 use babangida_domain::verification::{
     DecisionReason, RequestNote, VerificationApproved, VerificationRejected, VerificationRequest,
@@ -31,8 +34,9 @@ use babangida_domain::verification::{
 use babangida_shared::{Id, Timestamp};
 
 use crate::{
-    ApplicationError, Clock, GroupMembershipTxFactory, InviteCodeFactory, IssueInviteTxFactory,
-    PasswordHasher, RegistrationTxFactory, SessionTokenFactory, VerificationDecisionTxFactory,
+    ApiKeyFactory, ApiKeyHasher, ApplicationError, Clock, GroupMembershipTxFactory,
+    InviteCodeFactory, IssueInviteTxFactory, PasswordHasher, RegistrationTxFactory,
+    SessionTokenFactory, VerificationDecisionTxFactory,
 };
 
 /// Выдать инвайт от имени юзера.
@@ -1080,6 +1084,141 @@ impl<T: TrackRepository> WithdrawTrack<T> {
     }
 }
 
+/// Выпустить API-ключ (ADR-0018). Гейт верификации (ADR-0010): грузим владельца, читаем
+/// статус и передаём в домен — решает [`ApiKey::issue`]. Секрет генерится на границе
+/// (фабрика) и хэшируется (хэшер); владельцу возвращается сырой токен один раз.
+pub struct IssueApiKeyCommand {
+    pub owner: UserId,
+    pub label: ApiKeyLabel,
+}
+
+/// Раскрытый при выпуске ключ: агрегат + сырой токен (показывается владельцу единожды).
+#[derive(Debug)]
+pub struct IssuedApiKey {
+    pub key: ApiKey,
+    pub token: ApiKeyToken,
+}
+
+pub struct IssueApiKey<U, K, F, H, C> {
+    users: U,
+    keys: K,
+    factory: F,
+    hasher: H,
+    clock: C,
+}
+
+impl<U, K, F, H, C> IssueApiKey<U, K, F, H, C>
+where
+    U: UserRepository,
+    K: ApiKeyRepository,
+    F: ApiKeyFactory,
+    H: ApiKeyHasher,
+    C: Clock,
+{
+    pub fn new(users: U, keys: K, factory: F, hasher: H, clock: C) -> Self {
+        Self {
+            users,
+            keys,
+            factory,
+            hasher,
+            clock,
+        }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: владельца нет, он не верифицирован (`OpenApi`), либо сбой
+    /// хранилища.
+    pub async fn execute(&self, cmd: IssueApiKeyCommand) -> Result<IssuedApiKey, ApplicationError> {
+        let owner = self
+            .users
+            .find_by_id(cmd.owner)
+            .await?
+            .ok_or(ApplicationError::NotFound("owner"))?;
+        let token = self.factory.generate();
+        let hash = self.hasher.hash(&token);
+        let (key, _event) = ApiKey::issue(
+            ApiKeyId::generate(),
+            owner.id(),
+            owner.verified(),
+            cmd.label,
+            hash,
+            self.clock.now(),
+        )?;
+        self.keys.save(&key).await?;
+        Ok(IssuedApiKey { key, token })
+    }
+}
+
+/// Отозвать API-ключ.
+pub struct RevokeApiKeyCommand {
+    pub actor: UserId,
+    pub key: ApiKeyId,
+}
+
+/// Use-case отзыва. Право — у домена ([`ApiKey::revoke`]): только владелец, только из
+/// действующего.
+pub struct RevokeApiKey<K> {
+    keys: K,
+}
+
+impl<K: ApiKeyRepository> RevokeApiKey<K> {
+    pub fn new(keys: K) -> Self {
+        Self { keys }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`]: ключа нет, не владелец, уже отозван, либо сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: RevokeApiKeyCommand,
+    ) -> Result<ApiKeyRevoked, ApplicationError> {
+        let mut key = self
+            .keys
+            .find_by_id(cmd.key)
+            .await?
+            .ok_or(ApplicationError::NotFound("api key"))?;
+        let event = key.revoke(cmd.actor)?;
+        self.keys.save(&key).await?;
+        Ok(event)
+    }
+}
+
+/// Распознать владельца по предъявленному API-ключу — для экстрактора `/api/v1`.
+pub struct AuthenticateApiKeyCommand {
+    pub token: ApiKeyToken,
+}
+
+/// Use-case аутентификации по ключу. Хэшируем токен и ищем по хэшу; отозванный или
+/// неизвестный ключ — [`AuthError::Unauthenticated`] (как сессия, → 401).
+pub struct AuthenticateApiKey<K, H> {
+    keys: K,
+    hasher: H,
+}
+
+impl<K: ApiKeyRepository, H: ApiKeyHasher> AuthenticateApiKey<K, H> {
+    pub fn new(keys: K, hasher: H) -> Self {
+        Self { keys, hasher }
+    }
+
+    /// Возвращает [`UserId`] владельца ключа.
+    ///
+    /// # Errors
+    /// [`ApplicationError::Auth`] (`Unauthenticated`), если ключ неизвестен или отозван;
+    /// иначе сбой хранилища.
+    pub async fn execute(
+        &self,
+        cmd: AuthenticateApiKeyCommand,
+    ) -> Result<UserId, ApplicationError> {
+        let unauth = || ApplicationError::Auth(AuthError::Unauthenticated);
+        let hash = self.hasher.hash(&cmd.token);
+        let key = self.keys.find_by_hash(&hash).await?.ok_or_else(unauth)?;
+        if !key.status().is_active() {
+            return Err(unauth());
+        }
+        Ok(key.owner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1094,6 +1233,7 @@ mod tests {
     use babangida_domain::marketplace::{ListingTitle, MarketplaceError, Price};
     use babangida_domain::messaging::{Message, MessagingError};
     use babangida_domain::music::{AudioRef, MusicError, TrackStatus, TrackTitle};
+    use babangida_domain::openapi::{ApiKeyHash, ApiKeyStatus, OpenApiError};
     use babangida_domain::verification::{RequestStatus, VerificationError};
     use babangida_shared::{Duration, Timestamp};
 
@@ -2507,5 +2647,217 @@ mod tests {
             tracks.saved.lock().unwrap()[0].status(),
             TrackStatus::Withdrawn
         );
+    }
+
+    // --- openapi: выпуск/отзыв/аутентификация ключей (ADR-0018) ---
+
+    #[derive(Clone)]
+    struct FakeApiKeys {
+        saved: Arc<Mutex<Vec<ApiKey>>>,
+    }
+    impl FakeApiKeys {
+        fn empty() -> Self {
+            Self {
+                saved: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+    #[async_trait]
+    impl ApiKeyRepository for FakeApiKeys {
+        async fn find_by_id(&self, id: ApiKeyId) -> Result<Option<ApiKey>, RepositoryError> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|k| k.id() == id)
+                .cloned())
+        }
+        async fn find_by_hash(&self, hash: &ApiKeyHash) -> Result<Option<ApiKey>, RepositoryError> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|k| k.hash().as_str() == hash.as_str())
+                .cloned())
+        }
+        async fn save(&self, key: &ApiKey) -> Result<(), RepositoryError> {
+            let mut v = self.saved.lock().unwrap();
+            v.retain(|k| k.id() != key.id());
+            v.push(key.clone());
+            Ok(())
+        }
+    }
+
+    struct FixedApiKeyFactory(ApiKeyToken);
+    impl ApiKeyFactory for FixedApiKeyFactory {
+        fn generate(&self) -> ApiKeyToken {
+            self.0.clone()
+        }
+    }
+
+    // Детерминированный «хэш»: префикс + сам токен. Достаточно для проверки потока.
+    #[derive(Clone, Copy)]
+    struct FakeApiKeyHasher;
+    impl ApiKeyHasher for FakeApiKeyHasher {
+        fn hash(&self, token: &ApiKeyToken) -> ApiKeyHash {
+            ApiKeyHash::from_storage(format!("h:{}", token.as_str()))
+        }
+    }
+
+    fn api_label() -> ApiKeyLabel {
+        ApiKeyLabel::parse("ci-bot").unwrap()
+    }
+    fn api_token() -> ApiKeyToken {
+        ApiKeyToken::parse(&format!("bbg_{}", "k".repeat(40))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn casual_cannot_issue_key() {
+        let owner = member("casual_dev");
+        let keys = FakeApiKeys::empty();
+        let err = IssueApiKey::new(
+            FakeUsers::with(vec![owner.clone()]),
+            keys.clone(),
+            FixedApiKeyFactory(api_token()),
+            FakeApiKeyHasher,
+            FixedClock(Timestamp::now()),
+        )
+        .execute(IssueApiKeyCommand {
+            owner: owner.id(),
+            label: api_label(),
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::OpenApi(OpenApiError::NotVerified)
+        ));
+        assert!(keys.saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn verified_issues_key_with_token() {
+        let mut owner = member("real_dev");
+        owner.verify();
+        let keys = FakeApiKeys::empty();
+        let issued = IssueApiKey::new(
+            FakeUsers::with(vec![owner.clone()]),
+            keys.clone(),
+            FixedApiKeyFactory(api_token()),
+            FakeApiKeyHasher,
+            FixedClock(Timestamp::now()),
+        )
+        .execute(IssueApiKeyCommand {
+            owner: owner.id(),
+            label: api_label(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(issued.token.as_str(), api_token().as_str());
+        assert_eq!(issued.key.owner(), owner.id());
+        // Хранится хэш, не сырой токен.
+        assert_eq!(
+            keys.saved.lock().unwrap()[0].hash().as_str(),
+            "h:bbg_kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_owner_revokes_key() {
+        let mut owner = member("dev_one");
+        owner.verify();
+        let keys = FakeApiKeys::empty();
+        let issued = IssueApiKey::new(
+            FakeUsers::with(vec![owner.clone()]),
+            keys.clone(),
+            FixedApiKeyFactory(api_token()),
+            FakeApiKeyHasher,
+            FixedClock(Timestamp::now()),
+        )
+        .execute(IssueApiKeyCommand {
+            owner: owner.id(),
+            label: api_label(),
+        })
+        .await
+        .unwrap();
+        let key_id = issued.key.id();
+        let err = RevokeApiKey::new(keys.clone())
+            .execute(RevokeApiKeyCommand {
+                actor: Id::generate(),
+                key: key_id,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::OpenApi(OpenApiError::NotOwner)
+        ));
+        RevokeApiKey::new(keys.clone())
+            .execute(RevokeApiKeyCommand {
+                actor: owner.id(),
+                key: key_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            keys.saved.lock().unwrap()[0].status(),
+            ApiKeyStatus::Revoked
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_resolves_owner_and_rejects_revoked() {
+        let mut owner = member("dev_two");
+        owner.verify();
+        let keys = FakeApiKeys::empty();
+        let issued = IssueApiKey::new(
+            FakeUsers::with(vec![owner.clone()]),
+            keys.clone(),
+            FixedApiKeyFactory(api_token()),
+            FakeApiKeyHasher,
+            FixedClock(Timestamp::now()),
+        )
+        .execute(IssueApiKeyCommand {
+            owner: owner.id(),
+            label: api_label(),
+        })
+        .await
+        .unwrap();
+
+        let resolved = AuthenticateApiKey::new(keys.clone(), FakeApiKeyHasher)
+            .execute(AuthenticateApiKeyCommand { token: api_token() })
+            .await
+            .unwrap();
+        assert_eq!(resolved, owner.id());
+
+        // неизвестный токен → Unauthenticated
+        let unknown = ApiKeyToken::parse(&format!("bbg_{}", "z".repeat(40))).unwrap();
+        let err = AuthenticateApiKey::new(keys.clone(), FakeApiKeyHasher)
+            .execute(AuthenticateApiKeyCommand { token: unknown })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Auth(AuthError::Unauthenticated)
+        ));
+
+        // отозванный ключ → Unauthenticated
+        RevokeApiKey::new(keys.clone())
+            .execute(RevokeApiKeyCommand {
+                actor: owner.id(),
+                key: issued.key.id(),
+            })
+            .await
+            .unwrap();
+        let err = AuthenticateApiKey::new(keys.clone(), FakeApiKeyHasher)
+            .execute(AuthenticateApiKeyCommand { token: api_token() })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplicationError::Auth(AuthError::Unauthenticated)
+        ));
     }
 }

@@ -8,6 +8,7 @@ use babangida_domain::identity::UserId;
 use babangida_domain::marketplace::ListingId;
 use babangida_domain::messaging::{ConversationId, MessageId};
 use babangida_domain::music::TrackId;
+use babangida_domain::openapi::ApiKeyId;
 use babangida_domain::verification::VerificationRequestId;
 use babangida_shared::Timestamp;
 
@@ -495,6 +496,50 @@ impl<R: MusicReadModel> ArtistTracksQuery<R> {
             .by_artist(&query.handle, query.limit)
             .await
             .map_err(Into::into)
+    }
+}
+
+// --- openapi: список ключей владельца (ADR-0018) ---
+
+/// Ключ под экран управления. Сам секрет НЕ отдаётся (его не хранит и не показывает
+/// никто, кроме момента выпуска).
+#[derive(Debug, Clone)]
+pub struct ApiKeyView {
+    pub key_id: ApiKeyId,
+    pub label: String,
+    pub status: String,
+    pub created_at: Timestamp,
+}
+
+/// Read-модель ключей.
+#[async_trait::async_trait]
+pub trait ApiKeyReadModel: Send + Sync {
+    /// Ключи владельца (свежие сверху) — для экрана управления.
+    async fn by_owner(
+        &self,
+        owner: UserId,
+    ) -> Result<Vec<ApiKeyView>, babangida_domain::RepositoryError>;
+}
+
+/// Запрос своих ключей.
+pub struct ApiKeysOf {
+    pub owner: UserId,
+}
+
+/// Use-case чтения своих ключей.
+pub struct ApiKeysQuery<R> {
+    keys: R,
+}
+
+impl<R: ApiKeyReadModel> ApiKeysQuery<R> {
+    pub fn new(keys: R) -> Self {
+        Self { keys }
+    }
+
+    /// # Errors
+    /// [`ApplicationError`] при сбое read-модели.
+    pub async fn execute(&self, query: ApiKeysOf) -> Result<Vec<ApiKeyView>, ApplicationError> {
+        self.keys.by_owner(query.owner).await.map_err(Into::into)
     }
 }
 

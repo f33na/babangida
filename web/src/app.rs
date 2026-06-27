@@ -70,6 +70,7 @@ pub fn App() -> impl IntoView {
                 <A href="/market">"маркет"</A>
                 <A href="/messages">"сообщения"</A>
                 <A href="/verification">"верификация"</A>
+                <A href="/api-keys">"API"</A>
                 <A href="/join">"вступить"</A>
                 <button
                     type="button"
@@ -90,6 +91,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/messages") view=InboxPage />
                     <Route path=path!("/messages/:id") view=ThreadPage />
                     <Route path=path!("/verification") view=VerificationPage />
+                    <Route path=path!("/api-keys") view=ApiKeysPage />
                     <Route path=path!("/login") view=LoginPage />
                     <Route path=path!("/join") view=JoinPage />
                 </Routes>
@@ -181,6 +183,22 @@ pub struct TrackDto {
     audio_url: String,
     #[serde(default)]
     genre: Option<String>,
+    status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiKeyDto {
+    key_id: String,
+    label: String,
+    status: String,
+}
+
+/// Ответ выпуска ключа: несёт сырой секрет (показывается один раз).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct IssuedApiKeyDto {
+    key_id: String,
+    label: String,
+    token: String,
     status: String,
 }
 
@@ -783,6 +801,83 @@ async fn withdraw_track(track_id: String) -> Result<(), ServerFnError> {
     }
 }
 
+// --- открытое API: персональные ключи (ADR-0018) ---
+
+/// Мои API-ключи (Bearer). Гость → пусто. Секрет не приходит — только метаданные.
+#[server]
+async fn fetch_api_keys() -> Result<Vec<ApiKeyDto>, ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Ok(Vec::new());
+    };
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api-keys", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    resp.json::<Vec<ApiKeyDto>>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Выпустить ключ (Bearer; только верифицированный). Ответ несёт сырой секрет —
+/// показывается один раз.
+#[server]
+async fn create_api_key(label: String) -> Result<IssuedApiKeyDto, ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api-keys", api_base()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "label": label }))
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => resp
+            .json::<IssuedApiKeyDto>()
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string())),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        403 => Err(ServerFnError::new(
+            "выпускать ключи может только verified — пройди верификацию".to_string(),
+        )),
+        422 => Err(ServerFnError::new(
+            "название ключа пустое или слишком длинное".to_string(),
+        )),
+        _ => Err(ServerFnError::new("не удалось выпустить ключ".to_string())),
+    }
+}
+
+/// Отозвать свой ключ (Bearer; только владелец).
+#[server]
+async fn revoke_api_key(key_id: String) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api-keys/{key_id}/revoke", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        403 => Err(ServerFnError::new("это не твой ключ".to_string())),
+        409 => Err(ServerFnError::new("ключ уже отозван".to_string())),
+        _ => Err(ServerFnError::new("не удалось отозвать ключ".to_string())),
+    }
+}
+
 // --- нав: текущий юзер ---
 
 #[component]
@@ -1106,6 +1201,148 @@ fn MusicPage() -> impl IntoView {
                             }
                                 .into_any()
                         }
+                    }
+                })}
+            </Suspense>
+        </div>
+    }
+}
+
+#[component]
+fn ApiKeysPage() -> impl IntoView {
+    let create = ServerAction::<CreateApiKey>::new();
+    let revoke = ServerAction::<RevokeApiKey>::new();
+    let created = create.value();
+    let me = Resource::new(|| (), |()| fetch_me());
+    let keys = Resource::new(
+        move || (create.version().get(), revoke.version().get()),
+        |_| fetch_api_keys(),
+    );
+    view! {
+        <div class="p-4 flex flex-col gap-4">
+            <h1 class="text-lg font-bold text-[var(--text)]">"API-ключи"</h1>
+            <p class="text-sm text-[var(--text-muted)]">
+                "ключ открывает доступ к /api/v1 от твоего имени (чтение и запись). секрет "
+                "показывается один раз при выпуске — сохрани его сразу."
+            </p>
+            // Выпуск — за гейтом верификации: форму видит только verified.
+            <Suspense fallback=move || {
+                view! { <p class="text-[var(--text-muted)]">"загрузка…"</p> }
+            }>
+                {move || Suspend::new(async move {
+                    match me.await.ok().flatten() {
+                        Some(m) if m.verified => {
+                            view! {
+                                <Card>
+                                    <ActionForm action=create attr:class="flex flex-col gap-3">
+                                        <Field
+                                            name="label"
+                                            label="название ключа"
+                                            placeholder="ci-bot"
+                                        />
+                                        <Button submit=true variant=ButtonVariant::Primary>
+                                            "выпустить ключ"
+                                        </Button>
+                                    </ActionForm>
+                                    {move || match created.get() {
+                                        Some(Ok(issued)) => {
+                                            view! {
+                                                <div class="mt-3 p-3 rounded-[var(--radius)] bg-[var(--surface-raised)] border border-[var(--accent)]">
+                                                    <p class="text-[var(--accent)] text-sm mb-1">
+                                                        "ключ создан — сохрани секрет, его больше не показать:"
+                                                    </p>
+                                                    <code class="block text-[var(--text)] break-all text-sm">
+                                                        {issued.token}
+                                                    </code>
+                                                </div>
+                                            }
+                                                .into_any()
+                                        }
+                                        Some(Err(e)) => {
+                                            view! {
+                                                <p class="mt-2 text-[var(--danger)] text-sm">{e.to_string()}</p>
+                                            }
+                                                .into_any()
+                                        }
+                                        None => ().into_any(),
+                                    }}
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        Some(_) => {
+                            view! {
+                                <Card>
+                                    <p class="text-sm text-[var(--text-muted)]">
+                                        "выпускать ключи могут только verified — "
+                                        <A href="/verification">"пройди верификацию"</A>
+                                    </p>
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        None => {
+                            view! {
+                                <Card>
+                                    <p class="text-sm text-[var(--text-muted)]">
+                                        <A href="/login">"войди"</A>
+                                        ", чтобы выпускать ключи"
+                                    </p>
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    match keys.await {
+                        Ok(items) if items.is_empty() => ().into_any(),
+                        Ok(items) => {
+                            view! {
+                                <div class="flex flex-col gap-3">
+                                    <h2 class="font-bold text-[var(--text)]">"твои ключи"</h2>
+                                    {items
+                                        .into_iter()
+                                        .map(|k| {
+                                            let active = k.status == "active";
+                                            let status = k.status.clone();
+                                            let revoke_btn = active
+                                                .then(|| {
+                                                    let id = k.key_id.clone();
+                                                    view! {
+                                                        <ActionForm action=revoke attr:class="inline">
+                                                            <input type="hidden" name="key_id" value=id />
+                                                            <button
+                                                                type="submit"
+                                                                class="text-sm text-[var(--text-muted)] hover:text-[var(--text)]"
+                                                            >
+                                                                "отозвать"
+                                                            </button>
+                                                        </ActionForm>
+                                                    }
+                                                });
+                                            view! {
+                                                <Card>
+                                                    <div class="flex items-center justify-between gap-3">
+                                                        <div class="flex items-center gap-2">
+                                                            <span class="font-semibold text-[var(--text)]">
+                                                                {k.label}
+                                                            </span>
+                                                            {(!active).then(|| view! { <Badge>{status}</Badge> })}
+                                                        </div>
+                                                        {revoke_btn}
+                                                    </div>
+                                                </Card>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        Err(_) => ().into_any(),
                     }
                 })}
             </Suspense>

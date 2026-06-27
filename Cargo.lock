@@ -396,6 +396,7 @@ dependencies = [
  "babangida-domain",
  "babangida-shared",
  "rand 0.8.6",
+ "sha2 0.10.9",
  "sqlx",
  "time",
  "tokio",

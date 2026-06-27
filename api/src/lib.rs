@@ -13,22 +13,24 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use babangida_application::ApplicationError;
 use babangida_application::command::{
-    ApproveVerification, ApproveVerificationCommand, Authenticate, AuthenticateCommand,
-    CreateListing, CreateListingCommand, CreatePost, CreatePostCommand, EstablishCredential,
-    EstablishCredentialCommand, FoundGroup, FoundGroupCommand, IssueInvite, IssueInviteCommand,
-    JoinGroup, JoinGroupCommand, LeaveGroup, LeaveGroupCommand, LogIn, LogInCommand, LogOut,
-    LogOutCommand, MarkListingSold, MarkListingSoldCommand, PostToGroup, PostToGroupCommand,
-    Register, RegisterCommand, RejectVerification, RejectVerificationCommand, ReleaseTrack,
-    ReleaseTrackCommand, RequestVerification, RequestVerificationCommand, SendMessage,
-    SendMessageCommand, SetMemberRole, SetMemberRoleCommand, VerifyUser, VerifyUserCommand,
-    WithdrawListing, WithdrawListingCommand, WithdrawTrack, WithdrawTrackCommand,
+    ApproveVerification, ApproveVerificationCommand, Authenticate, AuthenticateApiKey,
+    AuthenticateApiKeyCommand, AuthenticateCommand, CreateListing, CreateListingCommand,
+    CreatePost, CreatePostCommand, EstablishCredential, EstablishCredentialCommand, FoundGroup,
+    FoundGroupCommand, IssueApiKey, IssueApiKeyCommand, IssueInvite, IssueInviteCommand, JoinGroup,
+    JoinGroupCommand, LeaveGroup, LeaveGroupCommand, LogIn, LogInCommand, LogOut, LogOutCommand,
+    MarkListingSold, MarkListingSoldCommand, PostToGroup, PostToGroupCommand, Register,
+    RegisterCommand, RejectVerification, RejectVerificationCommand, ReleaseTrack,
+    ReleaseTrackCommand, RequestVerification, RequestVerificationCommand, RevokeApiKey,
+    RevokeApiKeyCommand, SendMessage, SendMessageCommand, SetMemberRole, SetMemberRoleCommand,
+    VerifyUser, VerifyUserCommand, WithdrawListing, WithdrawListingCommand, WithdrawTrack,
+    WithdrawTrackCommand,
 };
 use babangida_application::query::{
-    ArtistTracks, ArtistTracksQuery, FeedQuery, GroupBySlug, GroupQuery, GroupView, InboxOf,
-    InboxQuery, ListingView, MarketBrowse, MarketQuery, MusicBrowse, MusicQuery, MyVerificationOf,
-    MyVerificationQuery, PendingVerifications, PendingVerificationsQuery, ProfileByHandle,
-    ProfileQuery, ProfileView, RecentFeed, SellerListings, SellerListingsQuery, ThreadOf,
-    ThreadQuery, TrackView,
+    ApiKeyView, ApiKeysOf, ApiKeysQuery, ArtistTracks, ArtistTracksQuery, FeedQuery, GroupBySlug,
+    GroupQuery, GroupView, InboxOf, InboxQuery, ListingView, MarketBrowse, MarketQuery,
+    MusicBrowse, MusicQuery, MyVerificationOf, MyVerificationQuery, PendingVerifications,
+    PendingVerificationsQuery, ProfileByHandle, ProfileQuery, ProfileView, RecentFeed,
+    SellerListings, SellerListingsQuery, ThreadOf, ThreadQuery, TrackView,
 };
 use babangida_domain::RepositoryError;
 use babangida_domain::auth::{AuthError, Password, SESSION_TTL, SessionToken};
@@ -44,17 +46,18 @@ use babangida_domain::marketplace::{
 };
 use babangida_domain::messaging::{ConversationId, MessageBody, MessagingError};
 use babangida_domain::music::{AudioRef, Genre, MusicError, TrackDraft, TrackId, TrackTitle};
+use babangida_domain::openapi::{ApiKeyId, ApiKeyLabel, ApiKeyToken, OpenApiError};
 use babangida_domain::social::{DisplayName, Subculture};
 use babangida_domain::verification::{DecisionReason, RequestNote, VerificationRequestId};
 use babangida_infrastructure::{
-    Argon2PasswordHasher, Db, PgConversationRepository, PgCredentialRepository, PgFeedReadModel,
-    PgGroupMembershipTxFactory, PgGroupPostRepository, PgGroupReadModel, PgGroupRepository,
-    PgInboxReadModel, PgIssueInviteTxFactory, PgListingReadModel, PgListingRepository,
-    PgMessageRepository, PgMusicReadModel, PgPostRepository, PgProfileReadModel,
-    PgRegistrationTxFactory, PgSessionRepository, PgThreadReadModel, PgTrackRepository,
-    PgUserRepository, PgVerificationDecisionTxFactory, PgVerificationReadModel,
-    PgVerificationRequestRepository, RandomInviteCodeFactory, RandomSessionTokenFactory,
-    SystemClock,
+    Argon2PasswordHasher, Db, PgApiKeyReadModel, PgApiKeyRepository, PgConversationRepository,
+    PgCredentialRepository, PgFeedReadModel, PgGroupMembershipTxFactory, PgGroupPostRepository,
+    PgGroupReadModel, PgGroupRepository, PgInboxReadModel, PgIssueInviteTxFactory,
+    PgListingReadModel, PgListingRepository, PgMessageRepository, PgMusicReadModel,
+    PgPostRepository, PgProfileReadModel, PgRegistrationTxFactory, PgSessionRepository,
+    PgThreadReadModel, PgTrackRepository, PgUserRepository, PgVerificationDecisionTxFactory,
+    PgVerificationReadModel, PgVerificationRequestRepository, RandomApiKeyFactory,
+    RandomInviteCodeFactory, RandomSessionTokenFactory, Sha256ApiKeyHasher, SystemClock,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -99,6 +102,17 @@ pub fn router(state: AppState) -> Router {
         .route("/tracks/{id}/withdraw", post(withdraw_track))
         .route("/music", get(music))
         .route("/profiles/{handle}/tracks", get(artist_tracks))
+        // openapi: управление ключами под сессией (выпуск — за гейтом верификации)
+        .route("/api-keys", post(create_api_key).get(list_api_keys))
+        .route("/api-keys/{id}/revoke", post(revoke_api_key))
+        // открытое API: аутентификация по ключу (ADR-0018). Чтение + запись от владельца.
+        .route("/api/v1/me", get(api_me))
+        .route("/api/v1/feed", get(api_feed))
+        .route("/api/v1/profiles/{handle}", get(api_profile))
+        .route("/api/v1/music", get(api_music))
+        .route("/api/v1/market", get(api_market))
+        .route("/api/v1/posts", post(api_create_post))
+        .route("/api/v1/tracks", post(api_release_track))
         // верификация (ADR-0010/0016): заявка от юзера, очередь и решение — у админа;
         // прямой грант остаётся как админ-override.
         .route("/users/{handle}/verify", post(verify_user))
@@ -212,6 +226,13 @@ fn app_error_response(err: ApplicationError) -> (StatusCode, String) {
         ApplicationError::Music(e @ MusicError::NotPublished) => {
             (StatusCode::CONFLICT, e.to_string())
         }
+        // Открытое API: гейт верификации и право владельца — запрещено; отозванный — конфликт.
+        ApplicationError::OpenApi(e @ (OpenApiError::NotVerified | OpenApiError::NotOwner)) => {
+            (StatusCode::FORBIDDEN, e.to_string())
+        }
+        ApplicationError::OpenApi(e @ OpenApiError::AlreadyRevoked) => {
+            (StatusCode::CONFLICT, e.to_string())
+        }
         // Верификация: повторное решение по заявке — конфликт состояния.
         ApplicationError::Verification(e) => (StatusCode::CONFLICT, e.to_string()),
         ApplicationError::NotFound(what) => (StatusCode::NOT_FOUND, format!("не найдено: {what}")),
@@ -299,6 +320,33 @@ impl OptionalFromRequestParts<AppState> for CurrentUser {
             Err(e) => Err(ApiError::App(e)),
         }
     }
+}
+
+/// Вызывающий открытого API (`/api/v1`), распознанный по персональному API-ключу
+/// (ADR-0018). Ключ предъявляется как `Authorization: Bearer <ключ>`. Нет/невалидный/
+/// отозванный ключ → 401. Действия атрибутируются владельцу ключа (`id`).
+struct ApiCaller {
+    id: UserId,
+}
+
+impl FromRequestParts<AppState> for ApiCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Self::Rejection> {
+        let unauth = || ApiError::App(ApplicationError::Auth(AuthError::Unauthenticated));
+        let raw = bearer_from_headers(&parts.headers).ok_or_else(unauth)?;
+        let token = ApiKeyToken::parse(&raw).map_err(|_| unauth())?;
+        let uc =
+            AuthenticateApiKey::new(PgApiKeyRepository::new(st.db.clone()), Sha256ApiKeyHasher);
+        let owner = uc.execute(AuthenticateApiKeyCommand { token }).await?;
+        Ok(Self { id: owner })
+    }
+}
+
+/// Только `Authorization: Bearer` (без куки) — для API-ключей `/api/v1`.
+fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    auth.strip_prefix("Bearer ").map(|t| t.trim().to_owned())
 }
 
 /// Достать токен сессии из заголовков: сперва `Authorization: Bearer`, затем кука
@@ -1320,4 +1368,225 @@ async fn reject_verification(
         "request_id": event.request.to_string(),
         "status": "rejected",
     })))
+}
+
+// --- openapi: управление ключами (под сессией) + /api/v1 (под ключом, ADR-0018) ---
+
+#[derive(Deserialize)]
+struct ApiKeyReq {
+    label: String,
+}
+
+#[derive(Serialize)]
+struct IssuedApiKeyRes {
+    key_id: String,
+    label: String,
+    /// Сырой секрет — отдаётся ОДИН раз при выпуске; больше его не узнать.
+    token: String,
+    status: String,
+}
+
+async fn create_api_key(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Json(req): Json<ApiKeyReq>,
+) -> Result<Json<IssuedApiKeyRes>, ApiError> {
+    let label = ApiKeyLabel::parse(&req.label).map_err(invalid)?;
+    let uc = IssueApiKey::new(
+        PgUserRepository::new(st.db.clone()),
+        PgApiKeyRepository::new(st.db.clone()),
+        RandomApiKeyFactory,
+        Sha256ApiKeyHasher,
+        SystemClock,
+    );
+    let issued = uc
+        .execute(IssueApiKeyCommand {
+            owner: current.id,
+            label,
+        })
+        .await?;
+    Ok(Json(IssuedApiKeyRes {
+        key_id: issued.key.id().to_string(),
+        label: issued.key.label().as_str().to_owned(),
+        token: issued.token.as_str().to_owned(),
+        status: issued.key.status().as_str().to_owned(),
+    }))
+}
+
+#[derive(Serialize)]
+struct ApiKeyRes {
+    key_id: String,
+    label: String,
+    status: String,
+    created_at: i64,
+}
+
+impl From<ApiKeyView> for ApiKeyRes {
+    fn from(v: ApiKeyView) -> Self {
+        Self {
+            key_id: v.key_id.to_string(),
+            label: v.label,
+            status: v.status,
+            created_at: v.created_at.into_offset().unix_timestamp(),
+        }
+    }
+}
+
+async fn list_api_keys(
+    State(st): State<AppState>,
+    current: CurrentUser,
+) -> Result<Json<Vec<ApiKeyRes>>, ApiError> {
+    let uc = ApiKeysQuery::new(PgApiKeyReadModel::new(st.db.clone()));
+    let items = uc.execute(ApiKeysOf { owner: current.id }).await?;
+    Ok(Json(items.into_iter().map(ApiKeyRes::from).collect()))
+}
+
+async fn revoke_api_key(
+    State(st): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = ApiKeyId::parse(&id).map_err(invalid)?;
+    RevokeApiKey::new(PgApiKeyRepository::new(st.db.clone()))
+        .execute(RevokeApiKeyCommand {
+            actor: current.id,
+            key,
+        })
+        .await?;
+    Ok(Json(json!({ "key_id": id, "status": "revoked" })))
+}
+
+// /api/v1 — под персональным ключом. Чтение публичных данных + запись от владельца.
+
+async fn api_me(
+    State(st): State<AppState>,
+    caller: ApiCaller,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = PgUserRepository::new(st.db.clone())
+        .find_by_id(caller.id)
+        .await
+        .map_err(|e| ApiError::App(e.into()))?
+        .ok_or(ApiError::App(ApplicationError::NotFound("user")))?;
+    Ok(Json(json!({
+        "handle": user.handle().as_str(),
+        "verified": user.verified().is_verified(),
+    })))
+}
+
+async fn api_feed(
+    State(st): State<AppState>,
+    caller: ApiCaller,
+    Query(params): Query<FeedParams>,
+) -> Result<Json<Vec<FeedItemRes>>, ApiError> {
+    let uc = FeedQuery::new(PgFeedReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(RecentFeed {
+            viewer: Some(caller.id),
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    let out = items
+        .into_iter()
+        .map(|i| FeedItemRes {
+            post_id: i.post_id.to_string(),
+            author: i.author.to_string(),
+            author_handle: i.author_handle,
+            body: i.body,
+            created_at: i.created_at.into_offset().unix_timestamp(),
+            group_slug: i.group_slug,
+            group_name: i.group_name,
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn api_profile(
+    State(st): State<AppState>,
+    _caller: ApiCaller,
+    Path(handle): Path<String>,
+) -> Result<Json<ProfileRes>, ApiError> {
+    let uc = ProfileQuery::new(PgProfileReadModel::new(st.db.clone()));
+    let view = uc.execute(ProfileByHandle { handle }).await?;
+    Ok(Json(view.into()))
+}
+
+async fn api_music(
+    State(st): State<AppState>,
+    _caller: ApiCaller,
+    Query(params): Query<FeedParams>,
+) -> Result<Json<Vec<TrackRes>>, ApiError> {
+    let uc = MusicQuery::new(PgMusicReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(MusicBrowse {
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    Ok(Json(items.into_iter().map(TrackRes::from).collect()))
+}
+
+async fn api_market(
+    State(st): State<AppState>,
+    _caller: ApiCaller,
+    Query(params): Query<FeedParams>,
+) -> Result<Json<Vec<ListingRes>>, ApiError> {
+    let uc = MarketQuery::new(PgListingReadModel::new(st.db.clone()));
+    let items = uc
+        .execute(MarketBrowse {
+            limit: params.limit.unwrap_or(50),
+        })
+        .await?;
+    Ok(Json(items.into_iter().map(ListingRes::from).collect()))
+}
+
+async fn api_create_post(
+    State(st): State<AppState>,
+    caller: ApiCaller,
+    Json(req): Json<PostReq>,
+) -> Result<Json<PostRes>, ApiError> {
+    let cmd = CreatePostCommand {
+        author: caller.id,
+        body: PostBody::parse(&req.body).map_err(invalid)?,
+    };
+    let uc = CreatePost::new(PgPostRepository::new(st.db.clone()), SystemClock);
+    let post = uc.execute(cmd).await?;
+    Ok(Json(PostRes {
+        post_id: post.id().to_string(),
+        created_at: post.created_at().into_offset().unix_timestamp(),
+    }))
+}
+
+async fn api_release_track(
+    State(st): State<AppState>,
+    caller: ApiCaller,
+    Json(req): Json<TrackReq>,
+) -> Result<Json<ReleasedTrackRes>, ApiError> {
+    let genre = req
+        .genre
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Genre::parse)
+        .transpose()
+        .map_err(invalid)?;
+    let draft = TrackDraft {
+        title: TrackTitle::parse(&req.title).map_err(invalid)?,
+        audio: AudioRef::parse(&req.audio_url).map_err(invalid)?,
+        genre,
+    };
+    let uc = ReleaseTrack::new(
+        PgUserRepository::new(st.db.clone()),
+        PgTrackRepository::new(st.db.clone()),
+        SystemClock,
+    );
+    let track = uc
+        .execute(ReleaseTrackCommand {
+            uploader: caller.id,
+            draft,
+        })
+        .await?;
+    Ok(Json(ReleasedTrackRes {
+        track_id: track.id().to_string(),
+        status: track.status().as_str().to_owned(),
+        created_at: track.created_at().into_offset().unix_timestamp(),
+    }))
 }
