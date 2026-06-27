@@ -11,7 +11,7 @@ use babangida_uikit::{
     Avatar, Badge, Button, ButtonVariant, Card, FeedItem, Field, ListingCard, Nav, TextArea,
 };
 use leptos::prelude::*;
-use leptos_meta::{Html, MetaTags, Stylesheet, Title, provide_meta_context};
+use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::path;
@@ -21,10 +21,15 @@ use serde::{Deserialize, Serialize};
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
-        <html lang="ru">
+        // data-theme=dark — дефолт для no-JS; скрипт ниже до отрисовки подменяет его
+        // на сохранённую в куке тему (без вспышки), и держит переключатель темы.
+        <html lang="ru" data-theme="dark">
             <head>
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
+                <script>
+                    "(function(){var m=document.cookie.match(/(?:^|; )theme=([^;]*)/);document.documentElement.dataset.theme=m?m[1]:'dark';window.__toggleTheme=function(){var c=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=c;document.cookie='theme='+c+'; path=/; max-age=31536000; samesite=lax';};})();"
+                </script>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options />
                 <MetaTags />
@@ -38,24 +43,25 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
     }
 }
 
+/// Переключить тему (dark↔light): зовёт глобальный `__toggleTheme` из инлайн-скрипта
+/// в `shell` (он же пишет куку). На сервере — no-op (выполняется только в браузере).
+fn toggle_theme() {
+    #[cfg(feature = "hydrate")]
+    toggle_theme_js();
+}
+
+#[cfg(feature = "hydrate")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = __toggleTheme)]
+    fn toggle_theme_js();
+}
+
 /// Корневой компонент: тема, навигация (с текущим юзером), роуты.
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
-    let (theme, set_theme) = signal("dark".to_string());
-    let toggle = move |_| {
-        set_theme.update(|t| {
-            *t = if t == "dark" {
-                "light".into()
-            } else {
-                "dark".into()
-            }
-        });
-    };
-
     view! {
-        // Реактивно ставим data-theme на <html> (SSR + гидратация).
-        <Html attr:data-theme=move || theme.get() />
         <Router>
             <Nav>
                 <A href="/">"лента"</A>
@@ -65,7 +71,7 @@ pub fn App() -> impl IntoView {
                 <button
                     type="button"
                     class="px-3 py-1 rounded-[var(--radius)] border border-[var(--border)] text-[var(--text)]"
-                    on:click=toggle
+                    on:click=move |_| toggle_theme()
                 >
                     "тема"
                 </button>
