@@ -13,7 +13,7 @@ use babangida_uikit::{
 use leptos::prelude::*;
 use leptos_meta::{Html, MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::components::{A, Route, Router, Routes};
-use leptos_router::hooks::use_params_map;
+use leptos_router::hooks::{use_params_map, use_query_map};
 use leptos_router::path;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +60,7 @@ pub fn App() -> impl IntoView {
             <Nav>
                 <A href="/">"лента"</A>
                 <A href="/market">"маркет"</A>
+                <A href="/messages">"сообщения"</A>
                 <A href="/join">"вступить"</A>
                 <button
                     type="button"
@@ -76,6 +77,8 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/market") view=MarketPage />
                     <Route path=path!("/u/:handle") view=ProfilePage />
                     <Route path=path!("/g/:slug") view=GroupPage />
+                    <Route path=path!("/messages") view=InboxPage />
+                    <Route path=path!("/messages/:id") view=ThreadPage />
                     <Route path=path!("/login") view=LoginPage />
                     <Route path=path!("/join") view=JoinPage />
                 </Routes>
@@ -99,11 +102,25 @@ pub struct FeedItemDto {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProfileDto {
+    user_id: String,
     handle: String,
     display_name: String,
     subculture: String,
     bio: Option<String>,
     verified: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ConversationDto {
+    conversation_id: String,
+    counterpart_handle: String,
+    last_message: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MessageDto {
+    author_handle: String,
+    body: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -450,6 +467,80 @@ async fn post_to_group(group_id: String, body: String) -> Result<(), ServerFnErr
     }
 }
 
+// --- личные сообщения (DM: старт с профиля, единый инбокс — анти-ВК) ---
+
+/// Инбокс текущего юзера (Bearer). Гость → пустой список.
+#[server]
+async fn fetch_inbox() -> Result<Vec<ConversationDto>, ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Ok(Vec::new());
+    };
+    let resp = reqwest::Client::new()
+        .get(format!("{}/inbox", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    resp.json::<Vec<ConversationDto>>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Переписка одного диалога (Bearer; только участник).
+#[server]
+async fn fetch_thread(conversation_id: String) -> Result<Vec<MessageDto>, ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/conversations/{conversation_id}/thread",
+            api_base()
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(ServerFnError::new(
+            "не удалось загрузить переписку".to_string(),
+        ));
+    }
+    resp.json::<Vec<MessageDto>>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Отправить сообщение по handle получателя (Bearer). Handle→UserId резолвится на
+/// сервере (api ждёт UserId), так что UI оперирует только handle.
+#[server]
+async fn send_message(recipient_handle: String, body: String) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let recipient = fetch_profile(recipient_handle).await?.user_id;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/messages", api_base()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "recipient": recipient, "body": body }))
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        422 => Err(ServerFnError::new(
+            "нельзя написать самому себе или пустой текст".to_string(),
+        )),
+        _ => Err(ServerFnError::new("не удалось отправить".to_string())),
+    }
+}
+
 // --- нав: текущий юзер ---
 
 #[component]
@@ -672,6 +763,8 @@ fn ProfilePage() -> impl IntoView {
     let handle = move || params.read().get("handle").unwrap_or_default();
     let sold = ServerAction::<MarkSold>::new();
     let withdraw = ServerAction::<Withdraw>::new();
+    let send = ServerAction::<SendMessage>::new();
+    let sent = send.value();
     let profile = Resource::new(handle, fetch_profile);
     let me = Resource::new(|| (), |()| fetch_me());
     // Товары перечитываются после sold/withdraw.
@@ -717,6 +810,48 @@ fn ProfilePage() -> impl IntoView {
                             view! { <p class="text-[var(--danger)]">"профиль не найден"</p> }
                                 .into_any()
                         }
+                    }
+                })}
+            </Suspense>
+            // Написать в личку — для залогиненных, на чужом профиле (анти-ВК: DM с профиля).
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    let my_handle = me.await.ok().flatten().map(|m| m.handle);
+                    let target = profile.await.ok().map(|p| p.handle);
+                    match (my_handle, target) {
+                        (Some(mh), Some(t)) if mh != t => {
+                            let label = format!("написать @{t}");
+                            view! {
+                                <Card>
+                                    <ActionForm action=send attr:class="flex flex-col gap-3">
+                                        <input type="hidden" name="recipient_handle" value=t />
+                                        <TextArea name="body" label=label placeholder="сообщение" />
+                                        <Button submit=true variant=ButtonVariant::Primary>
+                                            "отправить"
+                                        </Button>
+                                    </ActionForm>
+                                    {move || match sent.get() {
+                                        Some(Ok(())) => {
+                                            view! {
+                                                <p class="mt-2 text-[var(--accent)] text-sm">
+                                                    "отправлено · " <A href="/messages">"в сообщения"</A>
+                                                </p>
+                                            }
+                                                .into_any()
+                                        }
+                                        Some(Err(e)) => {
+                                            view! {
+                                                <p class="mt-2 text-[var(--danger)] text-sm">{e.to_string()}</p>
+                                            }
+                                                .into_any()
+                                        }
+                                        None => ().into_any(),
+                                    }}
+                                </Card>
+                            }
+                                .into_any()
+                        }
+                        _ => ().into_any(),
                     }
                 })}
             </Suspense>
@@ -900,6 +1035,155 @@ fn GroupPage() -> impl IntoView {
             </Suspense>
             {join_feedback}
             {post_feedback}
+        </div>
+    }
+}
+
+#[component]
+fn InboxPage() -> impl IntoView {
+    let me = Resource::new(|| (), |()| fetch_me());
+    let inbox = Resource::new(|| (), |()| fetch_inbox());
+    view! {
+        <div class="p-4 flex flex-col gap-3">
+            <h1 class="text-lg font-bold">"сообщения"</h1>
+            <Suspense fallback=move || {
+                view! { <p class="text-[var(--text-muted)]">"загрузка…"</p> }
+            }>
+                {move || Suspend::new(async move {
+                    if !matches!(me.await, Ok(Some(_))) {
+                        return view! {
+                            <p class="text-sm text-[var(--text-muted)]">
+                                <A href="/login">"войди"</A>
+                                ", чтобы читать сообщения"
+                            </p>
+                        }
+                            .into_any();
+                    }
+                    match inbox.await {
+                        Ok(items) if items.is_empty() => {
+                            view! { <p class="text-[var(--text-muted)]">"переписок пока нет"</p> }
+                                .into_any()
+                        }
+                        Ok(items) => {
+                            view! {
+                                <div class="flex flex-col gap-2">
+                                    {items
+                                        .into_iter()
+                                        .map(|c| {
+                                            let href = format!(
+                                                "/messages/{}?with={}",
+                                                c.conversation_id,
+                                                c.counterpart_handle,
+                                            );
+                                            view! {
+                                                <a href=href class="block">
+                                                    <Card>
+                                                        <div class="font-semibold text-[var(--text)]">
+                                                            "@"{c.counterpart_handle}
+                                                        </div>
+                                                        <div class="text-[var(--text-muted)] truncate">
+                                                            {c.last_message}
+                                                        </div>
+                                                    </Card>
+                                                </a>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        Err(_) => {
+                            view! {
+                                <p class="text-[var(--danger)]">"не удалось загрузить инбокс"</p>
+                            }
+                                .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+        </div>
+    }
+}
+
+#[component]
+fn ThreadPage() -> impl IntoView {
+    let params = use_params_map();
+    let query = use_query_map();
+    let id = move || params.read().get("id").unwrap_or_default();
+    // Собеседник прокинут из инбокса (`?with=handle`) — по нему шлём ответ.
+    let with = move || query.read().get("with").unwrap_or_default();
+    let send = ServerAction::<SendMessage>::new();
+    let sent = send.value();
+    let thread = Resource::new(
+        move || (id(), send.version().get()),
+        |(i, _)| fetch_thread(i),
+    );
+    view! {
+        <div class="p-4 flex flex-col gap-3">
+            <A href="/messages">"← к сообщениям"</A>
+            <Suspense fallback=move || {
+                view! { <p class="text-[var(--text-muted)]">"загрузка переписки…"</p> }
+            }>
+                {move || Suspend::new(async move {
+                    match thread.await {
+                        Ok(msgs) if msgs.is_empty() => {
+                            view! { <p class="text-[var(--text-muted)]">"пока пусто"</p> }.into_any()
+                        }
+                        Ok(msgs) => {
+                            view! {
+                                <div class="flex flex-col gap-2">
+                                    {msgs
+                                        .into_iter()
+                                        .map(|m| {
+                                            view! {
+                                                <Card>
+                                                    <div class="text-sm text-[var(--text-muted)]">
+                                                        "@"{m.author_handle}
+                                                    </div>
+                                                    <p class="text-[var(--text)] whitespace-pre-wrap break-words">
+                                                        {m.body}
+                                                    </p>
+                                                </Card>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        Err(e) => {
+                            view! { <p class="text-[var(--danger)]">{e.to_string()}</p> }.into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+            {move || {
+                let w = with();
+                (!w.is_empty())
+                    .then(|| {
+                        view! {
+                            <Card>
+                                <ActionForm action=send attr:class="flex flex-col gap-3">
+                                    <input type="hidden" name="recipient_handle" value=w />
+                                    <TextArea name="body" label="ответить" placeholder="сообщение" />
+                                    <Button submit=true variant=ButtonVariant::Primary>
+                                        "отправить"
+                                    </Button>
+                                </ActionForm>
+                                {move || match sent.get() {
+                                    Some(Err(e)) => {
+                                        view! {
+                                            <p class="mt-2 text-[var(--danger)] text-sm">{e.to_string()}</p>
+                                        }
+                                            .into_any()
+                                    }
+                                    _ => ().into_any(),
+                                }}
+                            </Card>
+                        }
+                    })
+            }}
         </div>
     }
 }

@@ -59,3 +59,9 @@ read-модели `Inbox`/`Thread`/`Group`, tx-порт членства `GroupM
   (`POST /groups/{id}/posts`) для залогиненных. Вход на страницу — по чипу группы в общей
   ленте (анти-ВК: сообщество — срез ленты, не отдельное приложение). Лента получила composer
   поста (`POST /posts`) и чип группы у постов пабликов. uikit += `TextArea`. ssr+wasm зелёные.
+- 2026-06-27: web-UI личные сообщения. Инбокс `/messages` (`GET /inbox`: собеседник +
+  последнее сообщение), тред `/messages/:id?with=handle` (`GET /conversations/{id}/thread`)
+  с ответом, старт переписки с чужого профиля («написать @handle»). Узкое место «recipient —
+  UserId, не handle» снято: server-fn `send_message(recipient_handle)` сам резолвит handle→UserId
+  через `GET /profiles/{handle}`, UI оперирует только handle. Нав += «сообщения». Анти-ВК: DM
+  стартует с профиля и живёт в одном инбоксе, не отдельным мессенджером. ssr+wasm зелёные.
