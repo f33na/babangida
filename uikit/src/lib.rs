@@ -20,5 +20,5 @@ mod components_dioxus;
 /// (`FeedItem`) не сталкивались с Leptos-версией в корне крейта.
 #[cfg(feature = "dioxus")]
 pub mod dx {
-    pub use super::components_dioxus::FeedItem;
+    pub use super::components_dioxus::{Button, FeedItem, Field};
 }

@@ -425,9 +425,7 @@ dependencies = [
 name = "babangida-mobile-android"
 version = "0.0.0"
 dependencies = [
- "babangida-domain",
- "babangida-shared",
- "babangida-uikit",
+ "babangida-mobile-ui",
  "dioxus",
 ]
 
@@ -435,10 +433,19 @@ dependencies = [
 name = "babangida-mobile-ios"
 version = "0.0.0"
 dependencies = [
- "babangida-domain",
- "babangida-shared",
+ "babangida-mobile-ui",
+ "dioxus",
+]
+
+[[package]]
+name = "babangida-mobile-ui"
+version = "0.0.0"
+dependencies = [
  "babangida-uikit",
  "dioxus",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

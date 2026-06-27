@@ -6,6 +6,57 @@
 use crate::tokens::{RADIUS, dark};
 use dioxus::prelude::*;
 
+/// Акцентная кнопка (тёмно-коричневая). `onclick` — обработчик нажатия.
+/// Зеркалит web-`Button` по смыслу; общий слой — токены, не разметка (ADR-0008).
+#[component]
+pub fn Button(onclick: EventHandler<MouseEvent>, children: Element) -> Element {
+    let style = format!(
+        "padding:10px 16px;border-radius:{}px;background:{};color:{};border:1px solid transparent;\
+         font-weight:600;font-size:15px;cursor:pointer;",
+        RADIUS,
+        dark::ACCENT,
+        dark::ACCENT_CONTRAST
+    );
+    rsx! {
+        button { style: "{style}", onclick: move |e| onclick.call(e), {children} }
+    }
+}
+
+/// Поле ввода с лейблом и двусторонней привязкой к сигналу. `password=true` —
+/// тип `password`. Стиль — из токенов (ADR-0008).
+#[component]
+pub fn Field(
+    label: String,
+    mut value: Signal<String>,
+    #[props(default)] password: bool,
+    #[props(default)] placeholder: String,
+) -> Element {
+    let wrap = format!(
+        "display:flex;flex-direction:column;gap:4px;color:{};font-size:14px;",
+        dark::TEXT_MUTED
+    );
+    let input_style = format!(
+        "padding:10px 12px;border-radius:{}px;border:1px solid {};background:{};color:{};font-size:15px;",
+        RADIUS,
+        dark::BORDER,
+        dark::SURFACE_RAISED,
+        dark::TEXT
+    );
+    let ty = if password { "password" } else { "text" };
+    rsx! {
+        label { style: "{wrap}",
+            "{label}"
+            input {
+                style: "{input_style}",
+                r#type: "{ty}",
+                placeholder: "{placeholder}",
+                value: value(),
+                oninput: move |e| value.set(e.value()),
+            }
+        }
+    }
+}
+
 /// Элемент ленты: аватар (первая буква handle) + автор + текст поста.
 /// Зеркалит web-аналог по смыслу; общий слой — токены, не разметка (ADR-0008).
 #[component]

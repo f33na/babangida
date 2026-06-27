@@ -27,3 +27,4 @@
 - [[decisions/0012-messaging-community-model]] — messaging (DM) и сообщества (группы/паблики).
 - [[decisions/0013-authentication-sessions]] — аутентификация и сессии (пароль + серверные токены).
 - [[decisions/0014-marketplace-model]] — маркетплейс (барахолка) за гейтом верификации.
+- [[decisions/0015-mobile-client-architecture]] — архитектура mobile-клиента (общий mobile-ui, прямой HTTP, сигнальная навигация).

@@ -8,6 +8,7 @@ members = [
     "api",
     "uikit",
     "web",
+    "mobile-ui",
     "mobile-ios",
     "mobile-android",
 ]
@@ -64,6 +65,7 @@ babangida-application = { path = "application" }
 babangida-infrastructure = { path = "infrastructure" }
 babangida-api = { path = "api" }
 babangida-uikit = { path = "uikit" }
+babangida-mobile-ui = { path = "mobile-ui" }
 
 # Линты на весь workspace. clippy в CI запускается с `-D warnings`.
 [workspace.lints.rust]

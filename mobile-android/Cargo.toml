@@ -16,9 +16,7 @@ workspace = true
 shell = ["dioxus/mobile", "dioxus/launch"]
 
 [dependencies]
-# Dioxus + нативный шелл (ADR-0007, самая рискованная ставка). Шарит `domain`,
-# `shared` и `uikit` (токены + Dioxus-виджеты под фичей `dioxus`).
-babangida-domain.workspace = true
-babangida-uikit = { workspace = true, features = ["dioxus"] }
-babangida-shared.workspace = true
+# Тонкий нативный шелл (ADR-0007/0015): весь UI и data-client — в общем
+# `mobile-ui`; здесь только запуск под Android (рендерер `mobile` под фичей `shell`).
+babangida-mobile-ui.workspace = true
 dioxus.workspace = true
