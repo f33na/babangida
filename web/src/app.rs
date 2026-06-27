@@ -8,7 +8,7 @@
 //! пробрасывается браузеру через `ResponseOptions`.
 
 use babangida_uikit::{
-    Avatar, Badge, Button, ButtonVariant, Card, FeedItem, Field, ListingCard, Nav,
+    Avatar, Badge, Button, ButtonVariant, Card, FeedItem, Field, ListingCard, Nav, TextArea,
 };
 use leptos::prelude::*;
 use leptos_meta::{Html, MetaTags, Stylesheet, Title, provide_meta_context};
@@ -75,6 +75,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/") view=FeedPage />
                     <Route path=path!("/market") view=MarketPage />
                     <Route path=path!("/u/:handle") view=ProfilePage />
+                    <Route path=path!("/g/:slug") view=GroupPage />
                     <Route path=path!("/login") view=LoginPage />
                     <Route path=path!("/join") view=JoinPage />
                 </Routes>
@@ -89,6 +90,11 @@ pub fn App() -> impl IntoView {
 pub struct FeedItemDto {
     author_handle: String,
     body: String,
+    /// Если пост из сообщества — слаг/имя группы (чип в общей ленте, анти-ВК).
+    #[serde(default)]
+    group_slug: Option<String>,
+    #[serde(default)]
+    group_name: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -108,10 +114,20 @@ pub struct MeDto {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ListingDto {
+    listing_id: String,
     title: String,
     seller_handle: String,
     price: u64,
     status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GroupDto {
+    group_id: String,
+    slug: String,
+    name: String,
+    kind: String,
+    member_count: u32,
 }
 
 #[cfg(feature = "ssr")]
@@ -157,6 +173,29 @@ async fn fetch_feed() -> Result<Vec<FeedItemDto>, ServerFnError> {
     Ok(items)
 }
 
+/// Опубликовать пост в общую ленту (от текущего юзера, Bearer-форвард).
+#[server]
+async fn create_post(body: String) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/posts", api_base()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        422 => Err(ServerFnError::new("пост не может быть пустым".to_string())),
+        _ => Err(ServerFnError::new("не удалось опубликовать".to_string())),
+    }
+}
+
 #[server]
 async fn fetch_profile(handle: String) -> Result<ProfileDto, ServerFnError> {
     let resp = reqwest::get(format!("{}/profiles/{handle}", api_base()))
@@ -166,6 +205,20 @@ async fn fetch_profile(handle: String) -> Result<ProfileDto, ServerFnError> {
         return Err(ServerFnError::new("профиль не найден".to_string()));
     }
     resp.json::<ProfileDto>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Товары продавца (публичное чтение): для профиля.
+#[server]
+async fn fetch_seller_listings(handle: String) -> Result<Vec<ListingDto>, ServerFnError> {
+    let resp = reqwest::get(format!("{}/profiles/{handle}/listings", api_base()))
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    resp.json::<Vec<ListingDto>>()
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
@@ -298,6 +351,105 @@ async fn create_listing(
     }
 }
 
+/// Отметить свой товар проданным (Bearer; только продавец).
+#[server]
+async fn mark_sold(listing_id: String) -> Result<(), ServerFnError> {
+    listing_action(&listing_id, "sold").await
+}
+
+/// Снять свой товар с продажи (Bearer; только продавец).
+#[server]
+async fn withdraw(listing_id: String) -> Result<(), ServerFnError> {
+    listing_action(&listing_id, "withdraw").await
+}
+
+/// Общий POST по товару текущего юзера: `sold` | `withdraw`.
+#[cfg(feature = "ssr")]
+async fn listing_action(listing_id: &str, action: &str) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/listings/{listing_id}/{action}", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        403 => Err(ServerFnError::new("это не твой товар".to_string())),
+        409 => Err(ServerFnError::new("товар уже неактивен".to_string())),
+        _ => Err(ServerFnError::new("не удалось обновить товар".to_string())),
+    }
+}
+
+// --- сообщества (анти-ВК: группа — срез общей ленты, не отдельное приложение) ---
+
+/// Карточка сообщества по слагу (публичное чтение).
+#[server]
+async fn fetch_group(slug: String) -> Result<GroupDto, ServerFnError> {
+    let resp = reqwest::get(format!("{}/groups/{slug}", api_base()))
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(ServerFnError::new("сообщество не найдено".to_string()));
+    }
+    resp.json::<GroupDto>()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Вступить в сообщество (Bearer-форвард).
+#[server]
+async fn join_group(group_id: String) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/groups/{group_id}/join", api_base()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        409 => Err(ServerFnError::new("ты уже в сообществе".to_string())),
+        _ => Err(ServerFnError::new("не удалось вступить".to_string())),
+    }
+}
+
+/// Опубликовать пост в сообщество (Bearer; только участник). Пост виден в общей ленте.
+#[server]
+async fn post_to_group(group_id: String, body: String) -> Result<(), ServerFnError> {
+    let Some(token) = session_token().await else {
+        return Err(ServerFnError::new("нужно войти".to_string()));
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("{}/groups/{group_id}/posts", api_base()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        401 => Err(ServerFnError::new(
+            "сессия истекла — войди заново".to_string(),
+        )),
+        403 | 404 => Err(ServerFnError::new(
+            "вступи в сообщество, чтобы постить".to_string(),
+        )),
+        422 => Err(ServerFnError::new("пост не может быть пустым".to_string())),
+        _ => Err(ServerFnError::new("не удалось опубликовать".to_string())),
+    }
+}
+
 // --- нав: текущий юзер ---
 
 #[component]
@@ -339,38 +491,101 @@ fn UserMenu() -> impl IntoView {
 
 #[component]
 fn FeedPage() -> impl IntoView {
-    let feed = Resource::new(|| (), |()| fetch_feed());
+    let post = ServerAction::<CreatePost>::new();
+    let posted = post.value();
+    let me = Resource::new(|| (), |()| fetch_me());
+    // Лента перечитывается после успешной публикации.
+    let feed = Resource::new(move || post.version().get(), |_| fetch_feed());
     view! {
-        <Suspense fallback=move || {
-            view! { <p class="p-4 text-[var(--text-muted)]">"загрузка ленты…"</p> }
-        }>
-            {move || Suspend::new(async move {
-                match feed.await {
-                    Ok(items) if items.is_empty() => {
-                        view! { <p class="p-4 text-[var(--text-muted)]">"пока пусто"</p> }.into_any()
-                    }
-                    Ok(items) => {
-                        view! {
-                            <div>
-                                {items
-                                    .into_iter()
-                                    .map(|i| {
-                                        view! { <FeedItem author_handle=i.author_handle body=i.body /> }
-                                    })
-                                    .collect_view()}
-                            </div>
+        <div class="flex flex-col">
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    match me.await {
+                        Ok(Some(_)) => {
+                            view! {
+                                <div class="p-4 border-b border-[var(--border)]">
+                                    <ActionForm action=post attr:class="flex flex-col gap-3">
+                                        <TextArea
+                                            name="body"
+                                            label="что нового"
+                                            placeholder="напиши в ленту"
+                                        />
+                                        <div class="flex items-center gap-3">
+                                            <Button submit=true variant=ButtonVariant::Primary>
+                                                "опубликовать"
+                                            </Button>
+                                            {move || match posted.get() {
+                                                Some(Ok(())) => {
+                                                    view! {
+                                                        <span class="text-[var(--accent)] text-sm">"опубликовано"</span>
+                                                    }
+                                                        .into_any()
+                                                }
+                                                Some(Err(e)) => {
+                                                    view! {
+                                                        <span class="text-[var(--danger)] text-sm">{e.to_string()}</span>
+                                                    }
+                                                        .into_any()
+                                                }
+                                                None => ().into_any(),
+                                            }}
+                                        </div>
+                                    </ActionForm>
+                                </div>
+                            }
+                                .into_any()
                         }
-                            .into_any()
-                    }
-                    Err(_) => {
-                        view! {
-                            <p class="p-4 text-[var(--danger)]">"не удалось загрузить ленту"</p>
+                        _ => {
+                            view! {
+                                <p class="p-4 text-sm text-[var(--text-muted)] border-b border-[var(--border)]">
+                                    <A href="/login">"войди"</A>
+                                    ", чтобы постить"
+                                </p>
+                            }
+                                .into_any()
                         }
-                            .into_any()
                     }
-                }
-            })}
-        </Suspense>
+                })}
+            </Suspense>
+            <Suspense fallback=move || {
+                view! { <p class="p-4 text-[var(--text-muted)]">"загрузка ленты…"</p> }
+            }>
+                {move || Suspend::new(async move {
+                    match feed.await {
+                        Ok(items) if items.is_empty() => {
+                            view! { <p class="p-4 text-[var(--text-muted)]">"пока пусто"</p> }
+                                .into_any()
+                        }
+                        Ok(items) => {
+                            view! {
+                                <div>
+                                    {items
+                                        .into_iter()
+                                        .map(|i| {
+                                            view! {
+                                                <FeedItem
+                                                    author_handle=i.author_handle
+                                                    body=i.body
+                                                    group_slug=i.group_slug
+                                                    group_name=i.group_name
+                                                />
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        Err(_) => {
+                            view! {
+                                <p class="p-4 text-[var(--danger)]">"не удалось загрузить ленту"</p>
+                            }
+                                .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+        </div>
     }
 }
 
@@ -455,9 +670,26 @@ fn MarketPage() -> impl IntoView {
 fn ProfilePage() -> impl IntoView {
     let params = use_params_map();
     let handle = move || params.read().get("handle").unwrap_or_default();
+    let sold = ServerAction::<MarkSold>::new();
+    let withdraw = ServerAction::<Withdraw>::new();
     let profile = Resource::new(handle, fetch_profile);
+    let me = Resource::new(|| (), |()| fetch_me());
+    // Товары перечитываются после sold/withdraw.
+    let listings = Resource::new(
+        move || (handle(), sold.version().get(), withdraw.version().get()),
+        |(h, _, _)| fetch_seller_listings(h),
+    );
+    // Ошибка последнего действия над товаром (реактивно, вне Suspense).
+    let action_error = move || {
+        let err = sold
+            .value()
+            .get()
+            .and_then(Result::err)
+            .or_else(|| withdraw.value().get().and_then(Result::err));
+        err.map(|e| view! { <p class="text-[var(--danger)] text-sm">{e.to_string()}</p> })
+    };
     view! {
-        <div class="p-4">
+        <div class="p-4 flex flex-col gap-4">
             <Suspense fallback=move || view! { <p class="text-[var(--text-muted)]">"загрузка…"</p> }>
                 {move || Suspend::new(async move {
                     match profile.await {
@@ -488,6 +720,186 @@ fn ProfilePage() -> impl IntoView {
                     }
                 })}
             </Suspense>
+            {action_error}
+            <Suspense fallback=|| ()>
+                {move || Suspend::new(async move {
+                    let my_handle = me.await.ok().flatten().map(|m| m.handle);
+                    match listings.await {
+                        Ok(items) if items.is_empty() => ().into_any(),
+                        Ok(items) => {
+                            view! {
+                                <div class="flex flex-col gap-3">
+                                    <h2 class="font-bold text-[var(--text)]">"товары"</h2>
+                                    {items
+                                        .into_iter()
+                                        .map(|l| {
+                                            let owner = my_handle.as_deref()
+                                                == Some(l.seller_handle.as_str());
+                                            let active = l.status == "active";
+                                            let actions = (owner && active)
+                                                .then(|| {
+                                                    let id_sold = l.listing_id.clone();
+                                                    let id_withdraw = l.listing_id.clone();
+                                                    view! {
+                                                        <div class="flex gap-3 pl-1">
+                                                            <ActionForm action=sold attr:class="inline">
+                                                                <input
+                                                                    type="hidden"
+                                                                    name="listing_id"
+                                                                    value=id_sold
+                                                                />
+                                                                <button
+                                                                    type="submit"
+                                                                    class="text-sm text-[var(--text-muted)] hover:text-[var(--text)]"
+                                                                >
+                                                                    "продано"
+                                                                </button>
+                                                            </ActionForm>
+                                                            <ActionForm action=withdraw attr:class="inline">
+                                                                <input
+                                                                    type="hidden"
+                                                                    name="listing_id"
+                                                                    value=id_withdraw
+                                                                />
+                                                                <button
+                                                                    type="submit"
+                                                                    class="text-sm text-[var(--text-muted)] hover:text-[var(--text)]"
+                                                                >
+                                                                    "снять"
+                                                                </button>
+                                                            </ActionForm>
+                                                        </div>
+                                                    }
+                                                });
+                                            view! {
+                                                <div class="flex flex-col gap-1">
+                                                    <ListingCard
+                                                        title=l.title
+                                                        seller_handle=l.seller_handle
+                                                        price=l.price
+                                                        status=l.status
+                                                    />
+                                                    {actions}
+                                                </div>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            }
+                                .into_any()
+                        }
+                        Err(_) => {
+                            view! {
+                                <p class="text-[var(--danger)]">"не удалось загрузить товары"</p>
+                            }
+                                .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+        </div>
+    }
+}
+
+#[component]
+fn GroupPage() -> impl IntoView {
+    let params = use_params_map();
+    let slug = move || params.read().get("slug").unwrap_or_default();
+    let join = ServerAction::<JoinGroup>::new();
+    let post = ServerAction::<PostToGroup>::new();
+    let me = Resource::new(|| (), |()| fetch_me());
+    // Карточка перечитывается после вступления/поста (обновляет счётчик участников).
+    let group = Resource::new(
+        move || (slug(), join.version().get(), post.version().get()),
+        |(s, _, _)| fetch_group(s),
+    );
+    let joined = join.value();
+    let posted = post.value();
+    let join_feedback = move || match joined.get() {
+        Some(Ok(())) => {
+            view! { <p class="text-[var(--accent)] text-sm">"ты в сообществе"</p> }.into_any()
+        }
+        Some(Err(e)) => {
+            view! { <p class="text-[var(--danger)] text-sm">{e.to_string()}</p> }.into_any()
+        }
+        None => ().into_any(),
+    };
+    let post_feedback = move || match posted.get() {
+        Some(Ok(())) => {
+            view! { <p class="text-[var(--accent)] text-sm">"опубликовано в ленте"</p> }.into_any()
+        }
+        Some(Err(e)) => {
+            view! { <p class="text-[var(--danger)] text-sm">{e.to_string()}</p> }.into_any()
+        }
+        None => ().into_any(),
+    };
+    view! {
+        <div class="p-4 flex flex-col gap-4">
+            <Suspense fallback=move || view! { <p class="text-[var(--text-muted)]">"загрузка…"</p> }>
+                {move || Suspend::new(async move {
+                    let logged_in = matches!(me.await, Ok(Some(_)));
+                    match group.await {
+                        Ok(g) => {
+                            let gid_join = g.group_id.clone();
+                            let gid_post = g.group_id.clone();
+                            let member_label = format!("{} участн.", g.member_count);
+                            let actions = if logged_in {
+                                view! {
+                                    <ActionForm action=join attr:class="inline">
+                                        <input type="hidden" name="group_id" value=gid_join />
+                                        <Button submit=true variant=ButtonVariant::Primary>
+                                            "вступить"
+                                        </Button>
+                                    </ActionForm>
+                                    <Card>
+                                        <ActionForm action=post attr:class="flex flex-col gap-3">
+                                            <input type="hidden" name="group_id" value=gid_post />
+                                            <TextArea
+                                                name="body"
+                                                label="написать в сообщество"
+                                                placeholder="пост увидят в общей ленте"
+                                            />
+                                            <Button submit=true variant=ButtonVariant::Primary>
+                                                "опубликовать"
+                                            </Button>
+                                        </ActionForm>
+                                    </Card>
+                                }
+                                    .into_any()
+                            } else {
+                                view! {
+                                    <p class="text-sm text-[var(--text-muted)]">
+                                        <A href="/login">"войди"</A>
+                                        ", чтобы вступить и постить"
+                                    </p>
+                                }
+                                    .into_any()
+                            };
+                            view! {
+                                <Card>
+                                    <div class="flex items-center justify-between gap-3">
+                                        <div>
+                                            <div class="text-lg font-bold">{g.name}</div>
+                                            <div class="text-[var(--text-muted)]">
+                                                "/g/"{g.slug} " · " {member_label}
+                                            </div>
+                                        </div>
+                                        <Badge accent=true>{g.kind}</Badge>
+                                    </div>
+                                </Card>
+                                {actions}
+                            }
+                                .into_any()
+                        }
+                        Err(_) => {
+                            view! { <p class="text-[var(--danger)]">"сообщество не найдено"</p> }
+                                .into_any()
+                        }
+                    }
+                })}
+            </Suspense>
+            {join_feedback}
+            {post_feedback}
         </div>
     }
 }

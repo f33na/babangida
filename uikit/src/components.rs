@@ -70,16 +70,33 @@ pub fn Avatar(#[prop(into)] handle: String) -> impl IntoView {
     }
 }
 
-/// Элемент ленты: аватар + автор + текст поста.
+/// Элемент ленты: аватар + автор + текст поста. Если пост из сообщества
+/// (`group_slug`/`group_name`) — чип-ссылка на группу прямо в общей ленте (анти-ВК).
 #[component]
-pub fn FeedItem(#[prop(into)] author_handle: String, #[prop(into)] body: String) -> impl IntoView {
+pub fn FeedItem(
+    #[prop(into)] author_handle: String,
+    #[prop(into)] body: String,
+    #[prop(default = None)] group_slug: Option<String>,
+    #[prop(default = None)] group_name: Option<String>,
+) -> impl IntoView {
     let handle = author_handle.clone();
+    let group = group_slug.zip(group_name).map(|(slug, name)| {
+        view! {
+            <a
+                href=format!("/g/{slug}")
+                class="inline-block mt-1 text-xs text-[var(--accent)] hover:underline"
+            >
+                "в сообществе "{name}
+            </a>
+        }
+    });
     view! {
         <article class="flex gap-3 p-3 border-b border-[var(--border)]">
             <Avatar handle=handle />
             <div class="flex-1 min-w-0">
                 <div class="font-semibold text-[var(--text)]">"@"{author_handle}</div>
                 <p class="text-[var(--text)] whitespace-pre-wrap break-words">{body}</p>
+                {group}
             </div>
         </article>
     }
@@ -121,6 +138,31 @@ pub fn Field(
                 class="px-3 py-2 bg-[var(--surface-raised)] border border-[var(--border)] \
                        rounded-[var(--radius)] text-[var(--text)] placeholder:text-[var(--text-muted)]"
             />
+        </label>
+    }
+}
+
+/// Многострочное поле — composer постов/сообщений. Аналог [`Field`], но `textarea`.
+/// `rows` задаёт стартовую высоту (по умолчанию 3); поле растягивается вертикально.
+#[component]
+pub fn TextArea(
+    #[prop(into)] name: String,
+    #[prop(into)] label: String,
+    #[prop(optional, into)] placeholder: String,
+    #[prop(optional)] rows: u32,
+) -> impl IntoView {
+    let rows = if rows == 0 { 3 } else { rows };
+    view! {
+        <label class="flex flex-col gap-1 text-sm text-[var(--text-muted)]">
+            {label}
+            <textarea
+                name=name
+                rows=rows
+                placeholder=placeholder
+                class="px-3 py-2 bg-[var(--surface-raised)] border border-[var(--border)] \
+                       rounded-[var(--radius)] text-[var(--text)] placeholder:text-[var(--text-muted)] \
+                       resize-y"
+            ></textarea>
         </label>
     }
 }
